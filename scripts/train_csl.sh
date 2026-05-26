@@ -7,7 +7,7 @@ main_task_retrieval.py --do_train --num_thread_reader=64 \
 --features_path "./CSL/RTM_Keypoints/" \
 --features_RGB_path "./CSL/I3D_features/" \
 --output_dir result_train/csl \
---signbert --init_sign_model ckpt/pretrain_signbert.pth \
+--signbert --init_sign_model ckpts/pretrain_signbert.pth \
 --fusion_type 'gloss_atten' --rgb_pose_match --rgb_pose_match_loss 0.4 \
 --lr 1e-5 --sign_lr 1e-4 \
 --max_words 32 --feature_len 64 --max_length_frames 300 \

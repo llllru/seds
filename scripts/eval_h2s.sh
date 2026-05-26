@@ -1,6 +1,6 @@
 DATA_PATH=""
 TIME_NOW=$(date +%Y%m%d%H%M%S)
-CUDA_VISIBLE_DEVICES="0" python -m torch.distributed.launch --nproc_per_node=1 --master_port 29668 \
+CUDA_VISIBLE_DEVICES="0" torchun --nproc_per_node=1 --master_port 29668 \
 main_task_retrieval.py --do_eval \
 --data_path data_h2 \
 --features_path "./How2Sign/RTMpose/Pose_all_24rates/" \

@@ -71,6 +71,7 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument('--text_num_hidden_layers', type=int, default=12, help="Layer NO. of text.")
     parser.add_argument('--freeze_layer_num', type=int, default=0, help="Layer NO. of CLIP need to freeze.")
     parser.add_argument('--not_load_visual', default=False, help="Layer NO. of CLIP need to freeze.")
+    parser.add_argument('--freeze_exfusion', type=int, default=0, help="Freeze the fusion module.")
     ##########  Net Archi  ##########
 
     ##########  Learning paras  ##########

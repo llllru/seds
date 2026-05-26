@@ -4,10 +4,10 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" python -m torch.distributed.launch --npro
 main_task_retrieval.py --do_train --num_thread_reader=64 \
 --epochs=200 --batch_size=128 --n_display=10 \
 --data_path data_h2 \
---features_path "./How2Sign/RTMpose/Pose_all_24rates/" \
---features_RGB_path "./How2Sign/I3D_features/" \
+--features_path "./How2Sign/processed_videos_256/RTMpose/Pose_all_24rates/" \
+--features_RGB_path "./How2Sign/processed_videos_256/I3D_features/" \
 --output_dir result_train/h2s \
---signbert --init_sign_model ckpt/pretrain_signbert.pth \
+--signbert --init_sign_model ckpts/pretrain_signbert.pth \
 --fusion_type 'gloss_atten' --rgb_pose_match --rgb_pose_match_loss 0.4 \
 --lr 1e-5 --sign_lr 1e-4 \
 --max_words 32 --feature_len 64 --max_length_frames 300 \
