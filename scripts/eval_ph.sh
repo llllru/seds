@@ -1,10 +1,10 @@
 DATA_PATH=""
 TIME_NOW=$(date +%Y%m%d%H%M%S)
-CUDA_VISIBLE_DEVICES="0" python -m torch.distributed.launch --nproc_per_node=1 --master_port 29668 \
+CUDA_VISIBLE_DEVICES="0" torchrun --nproc_per_node=1 --master_port 29668 \
 main_task_retrieval.py --do_eval \
 --data_path data_ph \
---features_path "./PHOENIX-2014-T/RTM_Keypoints/" \
---features_RGB_path "./PHOENIX-2014-T/I3D_features/" \
+--features_path "./PHOENIX-2014-T/features/RTM_Keypoints/" \
+--features_RGB_path "./PHOENIX-2014-T/features/I3D_features/" \
 --output_dir result_eval/eval_ph \
 --signbert \
 --init_model ckpts/ph_best_model.bin \

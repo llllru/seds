@@ -1,6 +1,6 @@
 DATA_PATH=""
 TIME_NOW=$(date +%Y%m%d%H%M%S)
-CUDA_VISIBLE_DEVICES="0" python -m torch.distributed.launch --nproc_per_node=1 --master_port 29448 \
+CUDA_VISIBLE_DEVICES="0" torchun --nproc_per_node=1 --master_port 29448 \
 main_task_retrieval.py --do_eval \
 --data_path data_csl \
 --features_path "./CSL/RTM_Keypoints/" \
@@ -17,4 +17,3 @@ main_task_retrieval.py --do_eval \
 --datatype csl_pose --coef_lr 1. --freeze_layer_num 0 \
 --linear_patch 2d --sim_header Filip \
 --pretrained_clip_name ViT-B/32
-
