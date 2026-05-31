@@ -20,6 +20,26 @@ from modules.modeling_signbert import init_sign_model
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
 
+
+import math
+# ===  新增：STaRC 显著性掩码生成模块  ===
+class STaRCSaliencyMasking(nn.Module):
+    def __init__(self, hidden_dim=512):
+        super().__init__()
+        self.W1 = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W2 = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.scale = math.sqrt(hidden_dim)
+
+    def forward(self, f_video):
+        x_g = f_video.mean(dim=1, keepdim=True)
+        local_keys = self.W1(f_video)
+        global_query = self.W2(x_g)
+        scores = (local_keys @ global_query.transpose(-1, -2)) / self.scale
+        p_s = torch.sigmoid(scores).squeeze(-1)
+        f_video_masked = f_video * p_s.unsqueeze(-1)
+        return f_video_masked, p_s
+# ===  新增结束  ===
+
 class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
     """ An abstract class to handle weights initialization and
         a simple interface for dowloading and loading pretrained models.
@@ -46,7 +66,6 @@ class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
         pretrained_clip_name = "ViT-B/32"
         if hasattr(task_config, 'pretrained_clip_name'):
             pretrained_clip_name = task_config.pretrained_clip_name
-        
         clip_state_dict = CLIP.get_config(pretrained_clip_name=pretrained_clip_name)
         for key, val in clip_state_dict.items():
             new_key = "clip." + key
@@ -185,7 +204,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         if hasattr(task_config, "sim_header"):
             self.sim_header = task_config.sim_header
             show_log(task_config, "\t sim_header: {}".format(self.sim_header))
-        
+
         if self.fusion_type == "mlp":
             self.fusion = MLP_feature_fusion(input_channel=task_config.hidden_dim*2, output_channel=task_config.hidden_dim)
         elif self.fusion_type == "gloss_atten":
@@ -194,6 +213,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         if self.signbert_have:
             self.signbert = init_sign_model(args=task_config)
 
+        self.saliency_masker = STaRCSaliencyMasking(hidden_dim=embed_dim)
+
         self.loss_fct = CrossEn()
 
         if self.rgb_pose_kl:
@@ -201,7 +222,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, right_batch, left_batch, body_batch, input_ids_aug=None, attention_mask_aug=None):
+    def forward(self, input_ids, token_type_ids, attention_mask, right_batch, left_batch, body_batch, saliency_true, input_ids_aug=None, attention_mask_aug=None):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
         input_ids_aug = input_ids_aug.view(-1, input_ids.shape[-1])
 
@@ -212,6 +233,9 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         sequence_hidden, text_mask, visual_hidden_pose, video_mask, visual_hidden_rgb, sequence_hidden_aug, text_mask_aug= self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
                                                                          right_batch, left_batch, body_batch, shaped=True, input_ids_aug=input_ids_aug, attention_mask_aug=attention_mask_aug)
 
+        raise RuntimeError(f" [Debug 拦截] visual_hidden_pose 的形状是: {visual_hidden_pose.shape}")
+
+        visual_hidden_pose, p_s = self.saliency_masker(visual_hidden_pose)
         if self.training:
             loss = 0.
             loss_pose_kl = 0.
@@ -238,7 +262,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 if self.rgb_pose_kl:
                     loss_pose_kl = self.kl_pose_loss * loss_pose_kl
                     loss_rgb_kl = self.kl_rgb_loss * loss_rgb_kl
-                
+
                 if self.rgb_pose_match:
                     sim_loss1_r2p=self.loss_fct(P2R_sim)*self.dual_mix+ self.loss_fct(P2R_sim.T)*(1-self.dual_mix)
                     sim_loss2_r2p=self.loss_fct(R2P_sim.T)*self.dual_mix+self.loss_fct(R2P_sim)*(1-self.dual_mix)
@@ -246,7 +270,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                     sim_loss_r2p = sim_loss_r2p * self.rgb_pose_match_loss
                 else:
                     sim_loss_r2p = 0.
-                
+
                 if self.freeze_exfusion:
                     loss += sim_loss
                 else:
@@ -272,13 +296,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         return sequence_hidden
 
     def get_sign_output(self, right_batch, left_batch, body_batch):
-        
+
         clips_start = body_batch['clips_start']
         clip_mask = body_batch['mask']
         rgb_feature = body_batch['rgb']
         batch_num, feature_len = clips_start.size()
         slide_windows = self.task_config.slide_windows
-        
+
         pose_all = {}
         pose_all['right'] = right_batch['pose']
         pose_all['left'] = left_batch['pose']
@@ -301,7 +325,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         del pose_all
         torch.cuda.empty_cache()
-        
+
 
         rgb_final = rgb_feature
 
@@ -309,13 +333,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         pose_final_new = self.signbert.sign_conv(pose_final_new)
         pose_final_new = pose_final_new.reshape(batch_num, feature_len, slide_windows, feat_dim)
         pose_final_new = torch.mean(pose_final_new, dim=-2)
-        
+
         pose_final_new = pose_final_new.permute(0, 2, 1).unsqueeze(-1)
-        
+
         return rgb_final, pose_final_new, clip_mask
 
     def get_visual_output(self, right_batch, left_batch, body_batch, shaped=True, get_hidden=True):
-        
+
         video_rgb, video_pose, video_mask = self.get_sign_output(right_batch, left_batch, body_batch)
 
         bs_pair = video_mask.size(0)
@@ -340,14 +364,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             input_ids = input_ids.view(-1, input_ids.shape[-1])
             token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
             attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
-        
+
         text_mask, sequence_hidden = self.get_sequence_output(input_ids,  token_type_ids, attention_mask, shaped=False)
         text_mask_aug, sequence_hidden_aug = self.get_sequence_output(input_ids_aug,  token_type_ids, attention_mask_aug, shaped=False)
 
         video_mask, visual_hidden_pose, visual_hidden_rgb = self.get_visual_output(right_batch, left_batch, body_batch, shaped=True)
 
         return sequence_hidden, text_mask, visual_hidden_pose, video_mask, visual_hidden_rgb, sequence_hidden_aug, text_mask_aug
-    
+
     def kl_double_modal_compute(self, batch_size, t_len, v_len, video_mask, attention_mask, text_mask_aug, i2t_sim_pose, i2t_sim_aug_pose, i2t_sim_rgb, i2t_sim_aug_rgb):
 
         with torch.no_grad():
@@ -410,9 +434,9 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         loss_rgb_kl = 0.5 * (self.loss_kl(stu_rgb_vt, teancher_pose_vt) + self.loss_kl(stu_rgb_tv, teancher_pose_tv))
 
         return loss_pose_kl, loss_rgb_kl
-    
+
     def flip_similarity_softmax(self, sequence_output, visual_hidden_pose, visual_hidden_rgb, attention_mask, video_mask, sim_header="meanP",pad_type=1,sequence_hidden_aug=None,text_mask_aug=None):
-        
+
         visual_hidden_fusion = self.fusion(visual_hidden_pose, visual_hidden_rgb, video_mask)
 
         if self.training and self.distributed:
@@ -426,7 +450,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sequence_hidden_aug = allgather(sequence_hidden_aug, self.task_config)
             attention_mask = allgather(attention_mask, self.task_config)
             text_mask_aug=allgather(text_mask_aug, self.task_config)
-            
+
             torch.distributed.barrier()
 
         video_mask = (video_mask == 0)
@@ -452,7 +476,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         sequence_hidden_aug = sequence_hidden_aug.squeeze(1)
 
         logit_scale = self.clip.logit_scale.exp()
-        
+
         #pose
         i2t_sim_pose=torch.einsum("ais, bjs->abij", [visual_hidden_pose, sequence_output])
 
@@ -480,7 +504,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         # i2t_sim_rgb_np = i2t_sim_rgb_cpu.numpy()
         # with open(os.path.join(self.task_config.output_dir, 'i2t_sim_rgb.pkl'), 'wb') as f:
         #     pkl.dump(i2t_sim_rgb_np, f)
-        
+
         i2t_sim_aug_rgb=torch.einsum("ais,bjs->abij", [visual_hidden_rgb, sequence_hidden_aug])
 
         after_softmax_i2t_rgb = torch.nansum(i2t_sim_rgb * torch.softmax(i2t_sim_rgb/0.07, dim=3), dim=3)
@@ -552,16 +576,16 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         if video_mask[0][0] == 1:
             ValueError("the video_mask[0][0] == 1")
-        
+
         if self.sim_header=='Filip' and is_train==True:
-            
+
             I2T_sim_fusion, T2I_sim_fusion, I2T_sim_pose, T2I_sim_pose, I2T_sim_rgb, T2I_sim_rgb, loss_pose_kl, loss_rgb_kl, P2R_sim, R2P_sim = self.flip_similarity_softmax(sequence_output, visual_hidden_pose, visual_hidden_rgb, attention_mask, video_mask,
                                                      sim_header=self.sim_header,sequence_hidden_aug=sequence_hidden_aug,text_mask_aug=text_mask_aug)
 
             return I2T_sim_fusion, T2I_sim_fusion, I2T_sim_pose, T2I_sim_pose, I2T_sim_rgb, T2I_sim_rgb, loss_pose_kl, loss_rgb_kl, P2R_sim, R2P_sim
-        
+
         return None, None, None
-    
+
 
 # with torch.no_grad():
 #     torch.set_printoptions(profile="full")

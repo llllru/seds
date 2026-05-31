@@ -165,7 +165,7 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--datatype", default="h2s", type=str, help="Point the dataset to finetune.")
 
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
+    parser.add_argument("--local_rank", "--local-rank",default=0, type=int, help="distribted training")
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
     parser.add_argument('--sampled_use_mil', action='store_true', help="Whether MIL, has a high priority than use_mil.")
@@ -398,7 +398,9 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         pairs_text_aug = sample['pairs_text_aug']
         pairs_mask_aug = sample['pairs_mask_aug']
 
-        loss, loss_fusion, loss_pose, loss_rgb, kl_pose, kl_rgb, loss_r2p = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch, pairs_text_aug, pairs_mask_aug)
+        saliency_true = sample['saliency_true']
+
+        loss, loss_fusion, loss_pose, loss_rgb, kl_pose, kl_rgb, loss_r2p = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch, pairs_text_aug, pairs_mask_aug, saliency_true)
 
         if args.debug == True:
             print("forward allocated:")
@@ -532,7 +534,6 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         sentence_num_ = test_dataloader.dataset.sentence_num
         video_num_ = test_dataloader.dataset.video_num
         cut_off_points_ = [itm - 1 for itm in cut_off_points_]
-
     if multi_sentence_:
         logger.warning("Eval under the multi-sentence per video clip setting.")
         logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))

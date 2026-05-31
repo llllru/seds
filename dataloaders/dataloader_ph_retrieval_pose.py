@@ -184,6 +184,7 @@ class ph_DataLoader_pose(Dataset):
 
         return sample
 
+
     def _get_pose_clips(self, pose_sample):
 
         frames_num, joints_num, coor_num = pose_sample.shape
@@ -248,12 +249,15 @@ class ph_DataLoader_pose(Dataset):
         total_frame_list = self.GetTotalFrameList(video_data, ori_img_size)
 
         sample = {}
+        #根据参数_get_single_handshape: [T, 21, 2]（时间帧，21个关键点，（x,y）坐标）和_get_body_pose（shape: [T, 7, 2]，（））获取单手和身体的关键点数据
         sample['right'] = self._get_single_hand('right' ,video_data, ori_img_size, total_frame_list.copy())
         sample['left'] = self._get_single_hand('left', video_data, ori_img_size, total_frame_list.copy())
         sample['body'] = self._get_body_pose(video_data, ori_img_size, total_frame_list)
 
         assert sample['right']['kp2d'].shape[0] == sample['left']['kp2d'].shape[0] == sample['body']['body_pose'].shape[0]
 
+    #视频数据的“切片与打包”过程是为了将连续的视频帧数据划分成固定长度的片段（clips），以便于模型的训练和评估。这个过程涉及以下几个步骤：
+        #sample中pose_sample是帧数与骨骼点与坐标值，clips_start挑选出来的、真实有效的片段起始帧索引填进去。pose_mask中对应的有效片段位置标记为0，无效片段位置标记为1。这样，模型在训练或评估时就可以根据pose_mask来区分哪些片段是有效的，哪些是无效的，从而更好地学习视频数据中的时序特征和模式。
         sample['right'] = self._get_pose_clips(sample['right']['kp2d'])
         sample['left'] = self._get_pose_clips(sample['left']['kp2d'])
         sample['body'] = self._get_pose_clips(sample['body']['body_pose'])
@@ -278,7 +282,7 @@ class ph_DataLoader_pose(Dataset):
         root_pos_valid = []
         for frame in total_frame_list:
             i = frame_list.index(frame)
-            skeleton = video_joints[i][:, 0:2]
+            skeleton = video_joints[i][:, 0:2]   #0:2 是切片（Slicing）语法，表示“从索引 0 开始，到索引 2 结束（但不包含索引 2）”
             confidences = video_joints[i][:, 2]
             body_pose, body_conf = self.get_kp2ds(skeleton, confidences, 0.0, part='body')
 
@@ -287,6 +291,7 @@ class ph_DataLoader_pose(Dataset):
             root_pos_gt.append(gt)
             root_pos_valid.append(body_conf)
 
+        # 在上面的 for 循环中，每一帧提取并缩放后的关键点数据被添加到 root_pos_gt 列表中，而对应的置信度数据被添加到 root_pos_valid 列表中。最后，这两个列表被转换为 NumPy 数组，并进一步转换为 PyTorch 张量，以便在后续的模型训练或评估过程中使用。
         root_pos_gt = np.stack(root_pos_gt, axis=0).astype(np.float32)
         root_pos_valid = np.stack(root_pos_valid, axis=0).astype(np.float32)
         root_pos_gt = torch.from_numpy(root_pos_gt).float()
@@ -356,7 +361,7 @@ class ph_DataLoader_pose(Dataset):
         kp2ds_total = torch.from_numpy(kp2ds_total).float()
         conf = torch.from_numpy(conf).float()
         sample = {
-            'kp2d': kp2ds_total,
+            'kp2d': kp2ds_total,  #单手数据
             # 'flag_2d': conf,
         }
         return sample
@@ -381,18 +386,21 @@ class ph_DataLoader_pose(Dataset):
         return hand_kp2d, confidence
 
     def GetTotalFrameList(self, video_data, ori_img_size):
-        video_joints = video_data['keypoints']
-        frame_list = video_data['img_list']
+        video_joints = video_data['keypoints']  # [frame_num, 133, 3]
+        frame_list = video_data['img_list']  #帧文件名列表
         assert video_joints.shape[0] == len(frame_list)
 
+        # 均匀采样
         if len(frame_list) > self.max_length_frames:
             interval = max(self.interval, math.ceil(len(frame_list) / self.max_length_frames))
             start = random.randint(0, interval)
             frame_index = slice(0, len(video_joints), interval)
             video_joints = video_joints[frame_index, :, :]
             frame_list = frame_list[frame_index]
-            
+
+        # 筛选出右手清晰可见的帧
         _, _,  frame_list_update_right = self.crop_hand('right', video_joints, ori_img_size, frame_list)
+        # 筛选出左手清晰可见的帧
         _, _, frame_list_update_left = self.crop_hand('left', video_joints, ori_img_size, frame_list)
         if frame_list_update_left is None:
             total_frame_list = frame_list_update_right
@@ -401,7 +409,7 @@ class ph_DataLoader_pose(Dataset):
         else:
             total_frame_list = list(set(frame_list_update_right + frame_list_update_left))
         total_frame_list = sorted(total_frame_list, key=lambda x: int(x.split('.')[0][6:]))
-        return total_frame_list
+        return total_frame_list  #返回筛选后的视频帧列表，筛选条件是右手或左手清晰可见
 
     def crop_hand(self, hand_side, video_joints, ori_img_size, frames_name):
         video_joints_new = []
