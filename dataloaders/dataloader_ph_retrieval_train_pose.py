@@ -5,14 +5,12 @@ from __future__ import print_function
 
 import torch
 import os
-import json
 from torch.utils.data import Dataset
 import numpy as np
 import pickle as pkl
 import random
 import math
 
-from textaugment import EDA
 from random import choice
 
 LEN_KPS = 10
@@ -25,7 +23,6 @@ class ph_DataLoader_train_pose(Dataset):
             subset,
             data_path,
             features_path,
-            features_RGB_path,
             tokenizer,
             max_words=30,
             feature_len=64,
@@ -36,7 +33,6 @@ class ph_DataLoader_train_pose(Dataset):
     ):
         self.data_path = data_path
         self.features_path = features_path
-        self.features_RGB_path = features_RGB_path
         self.interval = args.interval
         self.max_words = max_words
         self.tokenizer = tokenizer
@@ -58,7 +54,7 @@ class ph_DataLoader_train_pose(Dataset):
             captions = pkl.load(f)
 
         self.captions=captions
-        self.emd = EDA()
+        self.emd = None
         self.text_aug_choosen=args.text_aug_choosen
 
         sentance_ids = captions.keys()
@@ -70,20 +66,16 @@ class ph_DataLoader_train_pose(Dataset):
 
         self.sample_len = 0
         self.video_dict = {}
-        self.video_RGB_dict = {}
         self.cut_off_points = []
         video_num=0
 
         for sentance_id in sentance_ids:
             video_path = os.path.join(self.features_path, captions[sentance_id]['video_name']+'.pkl')
-            video_RGB_path = os.path.join(os.path.join(self.features_RGB_path, subset), captions[sentance_id]['video_name']+'.pkl')
 
             if sentance_id not in self.video_dict:
                 self.video_dict[sentance_id]=[video_path]
-                self.video_RGB_dict[sentance_id]=[video_RGB_path]
             else:
                 self.video_dict[sentance_id].append(video_path)
-                self.video_RGB_dict[sentance_id].append(video_RGB_path)
 
             video_num+=len(captions[sentance_id])
             self.cut_off_points.append(video_num)
@@ -94,7 +86,7 @@ class ph_DataLoader_train_pose(Dataset):
             self.video_num = len(self.video_dict)
             assert len(self.cut_off_points) == self.sentence_num
             print("For {}, sentence number: {}".format(self.subset, self.sentence_num))
-            print("For {},  video number: {}".format(self.subset, self.video_num))
+            print("For {}, video number: {}".format(self.subset, self.video_num))
 
         print("Sentance number: {}".format(len(self.sentences_dict )))
         print("Total Paire: {}".format(video_num))
@@ -103,113 +95,37 @@ class ph_DataLoader_train_pose(Dataset):
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
                               "MASK_TOKEN": "[MASK]", "UNK_TOKEN": "[UNK]", "PAD_TOKEN": "[PAD]"}
 
-        # 1. 获取当前这个 .py 文件所在的目录（即 dataloaders 文件夹）
-        current_dir = os.path.dirname(__file__)
-
-        # 2. 向上退一层（"..")，然后进入 "data_ph"，最后拼接上 JSON 文件名
-        json_path = os.path.join(current_dir, "..", "data_ph", "saliency_labels.json")
-
-        # （可选）整理路径格式，把 ".." 消化掉，变成好看的绝对路径
-        json_path = os.path.abspath(json_path)
-
-        try:
-            with open(json_path, "r") as f:
-                self.saliency_labels = json.load(f)
-        except Exception as e:
-            print(f"警告: 未找到 {json_path}。报错信息: {e}")
-            self.saliency_labels = {}
-
     def __len__(self):
         return self.sample_len
 
     def __getitem__(self, idx):
-        # 1. 原本的逻辑：获取文本、视频特征、骨骼特征
+
         sample_text, choice_sentance_ids = self._get_text(idx)
-        video_feature, video_mask, video_file_path = self._get_rawvideo(choice_sentance_ids)
+        video_file_path = self._choose_video_path(choice_sentance_ids)
+
         sample = self._get_pose(video_file_path)
-
-        # ================== 👇 我们新增的核心逻辑 👇 ==================
-
-        # 【第一步：拿着正确的“身份证”去查成绩单】
-        # choice_sentance_ids[0] 可能长这样：['01April_2010...']
-        # str() 把它变成纯文本字符串，这样才能去 JSON 字典里查到数据
-        sentence_id = str(choice_sentance_ids[0])
-
-        # 去字典里查这个视频的物理动能标签。
-        # 如果没查到（防报错），就默认给一堆全是 1.0 的数组（长度为 64）
-        y_true_list = self.saliency_labels.get(sentence_id, [1.0] * self.feature_len)
-
-        # 把普通的 Python 数组，变成显卡能认识的 Tensor (张量)格式
-        y_true_tensor = torch.tensor(y_true_list, dtype=torch.float32)
-
-        # 获取当前这个视频原本切出了多少个片段（比如 100 个，或者 40 个）
-        num_clips = len(y_true_tensor)
-
-        # 【第二步：削足适履，强制把标签长度变成标准的 64】
-        if num_clips > self.feature_len:
-            # 🔴 视频太长了（比如 100 份）
-            # 我们不能直接把尾巴砍掉，那样就和视频画面错位了！
-            # np.linspace 的作用是：在 0 到 99 之间，均匀地挑出 64 个数字（比如 0, 1.5, 3...）
-            all_index = list(np.linspace(0, num_clips - 1, self.feature_len, dtype=int))
-            choosen_idx = sorted(all_index)  # 把这些选中的序号排好队
-
-            # 按照选中的序号，把长标签“浓缩”成正好 64 份
-            y_true_tensor = y_true_tensor[choosen_idx]
-
-        elif num_clips < self.feature_len:
-            # 🔵 视频太短了（比如 40 份）
-            # 算出还差多少份才能到 64 份？(64 - 40 = 24 份)
-            padding_len = self.feature_len - num_clips
-
-            # torch.zeros 生成 24 个全是 0 的数组。
-            # torch.cat 把原来的 40 份，和新造的 24 份 0 拼接到一起，总数达到 64 份！
-            y_true_tensor = torch.cat([y_true_tensor, torch.zeros(padding_len)], dim=0)
-
-        # 如果长度不多不少正好是 64，那就什么都不用做，直接往下走。
-
-        # 【第三步：打包塞进书包】
-        # 把处理得完美无瑕的、长度绝对是 64 的标签，塞进原本的 sample 字典里
-        sample['saliency_true'] = y_true_tensor  # 此时它的 Shape 绝对是 [64]
         sample['text'] = sample_text
-        sample['RGB'] = video_feature
-
-        assert torch.sum(video_mask) == torch.sum(sample['right']['pose_mask']), print(torch.sum(video_mask), print(torch.sum(sample['right']['pose_mask'])), video_file_path)
 
         return sample
     
-    def _get_rawvideo(self, sentance_id):
-        videos=self.video_RGB_dict[sentance_id]
-        feature_len=self.feature_len
+    def _choose_video_path(self, sentance_id):
+        videos=self.video_dict[sentance_id]
         rands = random.randint(0, len(videos) - 1)
-        video_file_path=videos[rands]
+        return videos[rands]
 
-        video_feature = torch.zeros((1024, feature_len, 1))
-        video_mask = torch.ones(feature_len + 1, dtype=torch.long)
-        video_mask[0] = 0
-
-        with open(video_file_path, 'rb') as f:
-            item = pkl.load(f)
-            video_feature_pre = item['feature']
-
-        video_feature_pre=torch.Tensor(video_feature_pre).transpose(0, 1)
-        video_feature_pre=video_feature_pre.view(video_feature_pre.shape[0], -1, 1)
-
-        video_len=video_feature_pre.shape[1]
-
-        if video_len>=feature_len:
-            choosen_idx=range(video_len)
-            choosen_idx=list(choosen_idx)
-            ValueError("RGB data has problem!!!")
-        else:
-            choosen_idx=range(video_len)
-            choosen_idx=list(choosen_idx)
-
-        for i in range(len(choosen_idx)):
-            video_feature[:,i,:]=video_feature_pre[:,choosen_idx[i],:]
-            video_mask[i+1]=0
-
-
-        return video_feature, video_mask, video_file_path
+    def _get_eda(self):
+        if self.emd is None:
+            import nltk
+            from textaugment import EDA
+            nltk.data.find("corpora/stopwords")
+            nltk.data.find("corpora/wordnet")
+            nltk_download = nltk.download
+            nltk.download = lambda *args, **kwargs: True
+            try:
+                self.emd = EDA()
+            finally:
+                nltk.download = nltk_download
+        return self.emd
 
     def _get_text(self, ids):
         k = 1
@@ -219,36 +135,32 @@ class ph_DataLoader_train_pose(Dataset):
         pairs_text_aug = np.zeros((k, self.max_words), dtype=np.longlong)
         pairs_mask_aug = np.zeros((k, self.max_words), dtype=np.longlong)
 
-        # pairs_segment 是为了兼容 BERT 模型格式，但在这个任务中实际没有用到（因为只有单句输入）。
         pairs_segment = np.zeros((k, self.max_words), dtype=np.longlong)
         choice_sentance_ids,text=self.sentences_dict[ids][0],self.sentences_dict[ids][1]
         choice_sentance_ids=[choice_sentance_ids]
         for i, sentance_id in enumerate(choice_sentance_ids):
             is_aug=0
             choose_porb=0.5
-            # 随机决定是否进行文本增强 的条件判断,随机决定是否进行文本增强 的条件判断,根据 choose_porb 概率增强
             if self.text_aug_choosen=='all':
                 choose_porb = 0.8
             if self.text_aug==True and random.random()>1-choose_porb:
                 is_aug=1
+                emd = self._get_eda()
                 if self.text_aug_choosen=='synonym_replacement':
-                    emd_aug=self.emd.synonym_replacement
+                    emd_aug=emd.synonym_replacement
                 elif self.text_aug_choosen=='random_swap':
-                    emd_aug=self.emd.random_swap
+                    emd_aug=emd.random_swap
                 elif self.text_aug_choosen=='random_deletion':
-                    emd_aug=self.emd.random_deletion
+                    emd_aug=emd.random_deletion
                 else:
-                    emd_aug = choice([self.emd.synonym_replacement, self.emd.random_swap, self.emd.random_deletion])
+                    emd_aug = choice([emd.synonym_replacement, emd.random_swap, emd.random_deletion])
                 text_aug = emd_aug(text)
                 if isinstance(text_aug, list):
                     text_aug = ' '.join(text_aug)
-                # 只负责“拆分文本”，它返回的是字符串列表
                 words_aug = self.tokenizer.tokenize(text_aug)
-                # 添加CLS
                 words_aug = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words_aug
                 total_length_with_CLS = self.max_words - 1
                 words_index = [0]
-                # 长度控制 ：超过29词时均匀采样（保持等间隔），不超过时保持原样
                 if len(words_aug) > total_length_with_CLS:
                     # selected_index = list(np.arange(len(words)-1))
                     all_index = list(np.linspace(1, len(words_aug) - 1, total_length_with_CLS - 1, dtype=int))
@@ -257,7 +169,6 @@ class ph_DataLoader_train_pose(Dataset):
                     words_index += selected_index
                     words_aug = list(np.array(words_aug)[words_index])
                     # words = words[:total_length_with_CLS]
-
                 words_aug = words_aug + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
 
                 input_ids_aug = self.tokenizer.convert_tokens_to_ids(words_aug)
@@ -716,7 +627,6 @@ def ph_train_pose_collate_fn(batch, padding=6):
     :param padding: None
     :return: dict type, input data for SignBert model
     '''
-    batch_RGB = []
     batch_right = []
     batch_left = []
     batch_body = []
@@ -725,10 +635,8 @@ def ph_train_pose_collate_fn(batch, padding=6):
     batch_pairs_segment = []
     batch_pairs_text_aug = []
     batch_pairs_mask_aug = []
-    batch_saliency_true = []
 
     for i in range(len(batch)):
-        batch_RGB.append(batch[i]['RGB'])
         batch_right.append(batch[i]['right'])
         batch_left.append(batch[i]['left'])
         batch_body.append((batch[i]['body']))
@@ -738,7 +646,6 @@ def ph_train_pose_collate_fn(batch, padding=6):
         batch_pairs_segment.append((batch[i]['text']['pairs_segment']))
         batch_pairs_text_aug.append((batch[i]['text']['pairs_text_aug']))
         batch_pairs_mask_aug.append((batch[i]['text']['pairs_mask_aug']))
-        batch_saliency_true.append(batch[i]['saliency_true'])
 
     batch_right, _ = my_collate_fn_single_hand(batch_right)
     batch_left, _ = my_collate_fn_single_hand(batch_left)
@@ -779,19 +686,13 @@ def ph_train_pose_collate_fn(batch, padding=6):
     body_clips_start = torch.stack(body_clips_start, dim=0).long()
     body_mask = torch.stack(body_mask, dim=0).long()
 
-    RGB_feature = torch.stack(batch_RGB, dim=0).float()
     pairs_text = torch.stack(batch_pairs_text, dim=0).long()
     pairs_mask = torch.stack(batch_pairs_mask, dim=0).long()
     pairs_segment = torch.stack(batch_pairs_segment, dim=0).long()
     pairs_text_aug = torch.stack(batch_pairs_text_aug, dim=0).long()
     pairs_mask_aug = torch.stack(batch_pairs_mask_aug, dim=0).long()
 
-    saliency_true = torch.stack(batch_saliency_true, dim=0).float()
-
     return {'right_pose': right_pose, 'right_clips_start':right_clips_start,
             'left_pose': left_pose, 'left_clips_start':left_clips_start,
             'body_pose': body_pose,  'body_mask': body_mask, 'body_clips_start':body_clips_start,
-            'RGB_feature': RGB_feature,
-            'pairs_text':pairs_text, 'pairs_mask':pairs_mask, 'pairs_segment':pairs_segment, 'pairs_text_aug':pairs_text_aug, 'pairs_mask_aug':pairs_mask_aug,
-            'saliency_true': saliency_true
-            }
+            'pairs_text':pairs_text, 'pairs_mask':pairs_mask, 'pairs_segment':pairs_segment, 'pairs_text_aug':pairs_text_aug, 'pairs_mask_aug':pairs_mask_aug}

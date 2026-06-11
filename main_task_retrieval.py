@@ -33,6 +33,16 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (65535, rlimit[1]))
 
 torch.distributed.init_process_group(backend="nccl")
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ("yes", "true", "t", "1"):
+        return True
+    if value in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
 def get_args(description='CLCL on Retrieval Task'):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--do_pretrain", action='store_true', help="Whether to run training.")
@@ -47,7 +57,6 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument('--combine_type', type=str, default='sum', help='feature combine type')
     parser.add_argument('--video_path', type=str, default='', help='video path')
     parser.add_argument('--features_path', type=str, default='sign_features/h2s_domain_agnostic', help='feature path')
-    parser.add_argument('--features_RGB_path', type=str, default='sign_features/h2s_domain_aware', help='feature path')
     parser.add_argument('--alpha', type=float, default=0.8, help='feature combine weight')
     ##########  DA  ##########
 
@@ -60,7 +69,7 @@ def get_args(description='CLCL on Retrieval Task'):
 
 
     ##########  TA  ##########
-    parser.add_argument('--text_aug', default=True, help='whether to use text augmentation')
+    parser.add_argument('--text_aug', type=str2bool, default=True, help='whether to use text augmentation')
     parser.add_argument('--text_aug_choosen', type=str, default='random_swap', help='feature path',choices=['synonym_replacement','random_deletion','random_swap','all'])
     parser.add_argument('--aug_choose', type=str, default='t2v')
     ##########  TA  ##########
@@ -104,16 +113,11 @@ def get_args(description='CLCL on Retrieval Task'):
     ##########  Token length   ##########
     
     ##########  SignBert paras   ##########
-    parser.add_argument("--rgb_pose_match", action='store_true', help="")
-    parser.add_argument('--rgb_pose_match_loss', type=float, default=0.4, help='')
     parser.add_argument('--fusion_type', default='mlp', type=str, choices='mlp, gloss_atten')
-    parser.add_argument("--rgb_pose_kl", action='store_true', help="")
     parser.add_argument('--kl_pose_loss', type=float, default=0.5, help='')
-    parser.add_argument('--kl_rgb_loss', type=float, default=0.5, help='')
     parser.add_argument('--kl_logit', type=float, default=0.01, help='')
     parser.add_argument("--signbert", action='store_true', help="")
     parser.add_argument('--hidden_dim', type=int, default=512, help='')
-    parser.add_argument('--rgb_dim', type=int, default=1024, help='')
     parser.add_argument('--pose_dim', type=int, default=1536, help='')
     parser.add_argument('--dropout', type=float, default=0.1, help='')
     parser.add_argument('--heads', type=int, default=8, help='')
@@ -165,7 +169,8 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--datatype", default="h2s", type=str, help="Point the dataset to finetune.")
 
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", "--local-rank",default=0, type=int, help="distribted training")
+    # parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
+    parser.add_argument("--local_rank","--local-rank",dest="local_rank",default=0,type=int,help="distributed training")
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
     parser.add_argument('--sampled_use_mil', action='store_true', help="Whether MIL, has a high priority than use_mil.")
@@ -281,13 +286,13 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
     decay_param_tp = [(n, p) for n, p in param_optimizer if not any(nd in n for nd in no_decay)]
     no_decay_param_tp = [(n, p) for n, p in param_optimizer if any(nd in n for nd in no_decay)]
 
-    decay_clip_param_tp = [(n, p) for n, p in decay_param_tp if ("clip." in n) or ("clip_rgb." in n) ]
+    decay_clip_param_tp = [(n, p) for n, p in decay_param_tp if "clip." in n]
     decay_sign_param_tp = [(n, p) for n, p in decay_param_tp if "signbert." in n ]
-    decay_noclipsign_param_tp = [(n, p) for n, p in decay_param_tp if ("clip." not in n) and ("clip_rgb." not in n) and ("signbert." not in n)]
+    decay_noclipsign_param_tp = [(n, p) for n, p in decay_param_tp if ("clip." not in n) and ("signbert." not in n)]
 
-    no_decay_clip_param_tp = [(n, p) for n, p in no_decay_param_tp if ("clip." in n) or ("clip_rgb." in n) ]
+    no_decay_clip_param_tp = [(n, p) for n, p in no_decay_param_tp if "clip." in n]
     no_decay_sign_param_tp = [(n, p) for n, p in no_decay_param_tp if "signbert." in n]
-    no_decay_noclipsign_param_tp = [(n, p) for n, p in no_decay_param_tp if ("clip." not in n) and ("clip_rgb." not in n) and ("signbert." not in n)]
+    no_decay_noclipsign_param_tp = [(n, p) for n, p in no_decay_param_tp if ("clip." not in n) and ("signbert." not in n)]
 
     weight_decay = 0.001
     optimizer_grouped_parameters = [
@@ -390,7 +395,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         sample = batch
         right_batch = {'pose':sample['right_pose']}
         left_batch = {'pose':sample['left_pose']}
-        body_batch = {'pose':sample['body_pose'], 'clips_start':sample['body_clips_start'], 'mask':sample['body_mask'], 'rgb':sample['RGB_feature']}
+        body_batch = {'pose':sample['body_pose'], 'clips_start':sample['body_clips_start'], 'mask':sample['body_mask']}
         
         input_ids = sample['pairs_text']
         input_mask = sample['pairs_mask']
@@ -398,9 +403,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         pairs_text_aug = sample['pairs_text_aug']
         pairs_mask_aug = sample['pairs_mask_aug']
 
-        saliency_true = sample['saliency_true']
-
-        loss, loss_fusion, loss_pose, loss_rgb, kl_pose, kl_rgb, loss_r2p = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch, pairs_text_aug, pairs_mask_aug, saliency_true)
+        loss, loss_pose = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch, pairs_text_aug, pairs_mask_aug)
 
         if args.debug == True:
             print("forward allocated:")
@@ -437,14 +440,11 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
-                logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_f:%f, Loss_p:%f, Loss_r:%f, r2p:%f, T/S:%.3f", epoch + 1,
+                logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_p:%f, T/S:%.3f", epoch + 1,
                             args.epochs, step + 1,
                             len(train_dataloader),
                             float(loss),
-                            float(loss_fusion),
                             float(loss_pose),
-                            float(loss_rgb),
-                            float(loss_r2p),
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
 
@@ -452,63 +452,35 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
     return total_loss, global_step
 
 
-def _run_on_single_gpu_new_mix(model, batch_list_v, batch_list_t, batch_sequence_output_list, batch_visual_output_pose_list, batch_visual_output_rgb_list, is_train, hybird=False, alpha=0.5,dual_mix=0.5):
+def _run_on_single_gpu_new_mix(model, batch_list_v, batch_list_t, batch_sequence_output_list, batch_visual_output_pose_list, is_train, hybird=False, alpha=0.5,dual_mix=0.5):
 
     with torch.no_grad():
-        sim_matrix_i2t_fusion = []
-        sim_matrix_t2i_fusion = []
         sim_matrix_i2t_pose = []
         sim_matrix_t2i_pose = []
-        sim_matrix_i2t_rgb = []
-        sim_matrix_t2i_rgb = []
         for idx1, b1 in enumerate(batch_list_v):
             video_mask = b1
             visual_output_pose = batch_visual_output_pose_list[idx1]
-            visual_output_rgb = batch_visual_output_rgb_list[idx1]
-            # visual_output_cls=visual_cls[idx1]
-            each_row_fusion = []
-            each_row_fusion_t2i=[]
             each_row_pose = []
             each_row_pose_t2i=[]
-            each_row_rgb = []
-            each_row_rgb_t2i=[]
             for idx2, b2 in enumerate(batch_list_t):
                 text_mask = b2
                 sequence_output = batch_sequence_output_list[idx2]
-                # sequence_output_cls = sequence_cls[idx2]
 
-                I2T_sim_fusion, T2I_sim_fusion, I2T_sim_pose, T2I_sim_pose, I2T_sim_rgb, T2I_sim_rgb, *tmp = model.get_similarity_logits(sequence_output, visual_output_pose, visual_output_rgb, text_mask, video_mask,
+                I2T_sim_pose, T2I_sim_pose = model.get_similarity_logits(sequence_output, visual_output_pose, text_mask, video_mask,
                                                                          loose_type=model.loose_type,is_train=True)
-                I2T_sim_fusion = I2T_sim_fusion.cpu().detach().numpy()
-                T2I_sim_fusion = T2I_sim_fusion.cpu().detach().numpy()
                 I2T_sim_pose = I2T_sim_pose.cpu().detach().numpy()
                 T2I_sim_pose = T2I_sim_pose.cpu().detach().numpy()
-                I2T_sim_rgb = I2T_sim_rgb.cpu().detach().numpy()
-                T2I_sim_rgb = T2I_sim_rgb.cpu().detach().numpy()
                 
-                each_row_fusion.append(I2T_sim_fusion*dual_mix+T2I_sim_fusion*(1-dual_mix))
-                each_row_fusion_t2i.append(I2T_sim_fusion*dual_mix+T2I_sim_fusion*(1-dual_mix))
                 each_row_pose.append(I2T_sim_pose*dual_mix+T2I_sim_pose*(1-dual_mix))
                 each_row_pose_t2i.append(I2T_sim_pose*dual_mix+T2I_sim_pose*(1-dual_mix))
-                each_row_rgb.append(I2T_sim_rgb*dual_mix+T2I_sim_rgb*(1-dual_mix))
-                each_row_rgb_t2i.append(I2T_sim_rgb*dual_mix+T2I_sim_rgb*(1-dual_mix))
 
-
-            each_row_i2t_fusion = np.concatenate(tuple(each_row_fusion), axis=-1)
-            each_row_t2i_fusion = np.concatenate(tuple(each_row_fusion_t2i), axis=-1)
             each_row_i2t_pose = np.concatenate(tuple(each_row_pose), axis=-1)
             each_row_t2i_pose = np.concatenate(tuple(each_row_pose_t2i), axis=-1)
-            each_row_i2t_rgb = np.concatenate(tuple(each_row_rgb), axis=-1)
-            each_row_t2i_rgb = np.concatenate(tuple(each_row_rgb_t2i), axis=-1)
 
-            sim_matrix_i2t_fusion.append(each_row_i2t_fusion)
-            sim_matrix_t2i_fusion.append(each_row_t2i_fusion)
             sim_matrix_i2t_pose.append(each_row_i2t_pose)
             sim_matrix_t2i_pose.append(each_row_t2i_pose)
-            sim_matrix_i2t_rgb.append(each_row_i2t_rgb)
-            sim_matrix_t2i_rgb.append(each_row_t2i_rgb)
 
-        return sim_matrix_i2t_fusion, sim_matrix_t2i_fusion, sim_matrix_i2t_pose, sim_matrix_t2i_pose, sim_matrix_i2t_rgb, sim_matrix_t2i_rgb
+        return sim_matrix_i2t_pose, sim_matrix_t2i_pose
 
 
 def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
@@ -534,6 +506,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         sentence_num_ = test_dataloader.dataset.sentence_num
         video_num_ = test_dataloader.dataset.video_num
         cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+
     if multi_sentence_:
         logger.warning("Eval under the multi-sentence per video clip setting.")
         logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
@@ -544,7 +517,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
     with torch.no_grad():
         batch_list_t = []
         batch_list_v = []
-        batch_visual_output_pose_list, batch_visual_output_rgb_list = [], []
+        batch_visual_output_pose_list = []
         batch_sequence_output_list = []
 
         total_text_num = 0
@@ -558,7 +531,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
             sample = batch
             right_batch = {'pose':sample['right_pose']}
             left_batch = {'pose':sample['left_pose']}
-            body_batch = {'pose':sample['body_pose'], 'clips_start':sample['body_clips_start'], 'mask':sample['body_mask'], 'rgb':sample['RGB_feature']}
+            body_batch = {'pose':sample['body_pose'], 'clips_start':sample['body_clips_start'], 'mask':sample['body_mask']}
             video_mask = sample['body_mask']
             
             input_ids = sample['pairs_text']
@@ -569,9 +542,8 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
             b, *_t = input_ids.shape
             if multi_sentence_:
                 # multi-sentences retrieval means: one clip has two or more descriptions.
-                mask, visual_hidden_pose, visual_hidden_rgb = model.get_visual_output(right_batch, left_batch, body_batch, shaped=True, get_hidden=True)
+                mask, visual_hidden_pose = model.get_visual_output(right_batch, left_batch, body_batch, shaped=True, get_hidden=True)
                 batch_visual_output_pose_list.append(visual_hidden_pose)
-                batch_visual_output_rgb_list.append(visual_hidden_rgb)
                 batch_list_v.append(mask)
 
                 s_, e_ = total_text_num, total_text_num + b
@@ -597,42 +569,25 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
     #########################################
 
 
-        sim_matrix_i2t_fusion, sim_matrix_t2i_fusion, sim_matrix_i2t_pose, sim_matrix_t2i_pose, sim_matrix_i2t_rgb, sim_matrix_t2i_rgb = _run_on_single_gpu_new_mix(model,  batch_list_v,batch_list_t, batch_sequence_output_list, batch_visual_output_pose_list,\
-                                                           batch_visual_output_rgb_list,is_train=False,dual_mix=args.dual_mix)
+        sim_matrix_i2t_pose, sim_matrix_t2i_pose = _run_on_single_gpu_new_mix(model,  batch_list_v,batch_list_t, batch_sequence_output_list, batch_visual_output_pose_list,\
+                                                           is_train=False,dual_mix=args.dual_mix)
         
-        sim_matrix_i2t_fusion = np.concatenate(tuple(sim_matrix_i2t_fusion), axis=0)
-        sim_matrix_t2i_fusion = np.concatenate(tuple(sim_matrix_t2i_fusion), axis=0)
         sim_matrix_i2t_pose = np.concatenate(tuple(sim_matrix_i2t_pose), axis=0)
         sim_matrix_t2i_pose = np.concatenate(tuple(sim_matrix_t2i_pose), axis=0)
-        sim_matrix_i2t_rgb = np.concatenate(tuple(sim_matrix_i2t_rgb), axis=0)
-        sim_matrix_t2i_rgb = np.concatenate(tuple(sim_matrix_t2i_rgb), axis=0)
 
         if args.do_eval:
             logger.info(f"before reshape, sim matrix save to {args.output_dir}")
-            pkl.dump(sim_matrix_i2t_fusion, open(os.path.join(args.output_dir, "sim_matrix_i2t_before.pkl"), 'wb'))
-            pkl.dump(sim_matrix_t2i_fusion, open(os.path.join(args.output_dir, "sim_matrix_t2i_before.pkl"), 'wb'))
+            pkl.dump(sim_matrix_i2t_pose, open(os.path.join(args.output_dir, "sim_matrix_i2t_before.pkl"), 'wb'))
+            pkl.dump(sim_matrix_t2i_pose, open(os.path.join(args.output_dir, "sim_matrix_t2i_before.pkl"), 'wb'))
 
-        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix_i2t_fusion.shape[0], sim_matrix_i2t_fusion.shape[1]))
+        logger.info("before reshape, sim matrix size: {} x {}".format(sim_matrix_i2t_pose.shape[0], sim_matrix_i2t_pose.shape[1]))
         cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
         max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
 
-        sim_matrix_new_i2t_fusion = []
-        sim_matrix_new_t2i_fusion = []
         sim_matrix_new_i2t_pose = []
         sim_matrix_new_t2i_pose = []
-        sim_matrix_new_i2t_rgb = []
-        sim_matrix_new_t2i_rgb = []
 
         for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            # print(e_-s_,max_length-e_+s_)
-            # shape: [max_length, sim_matrix_i2t.shape[1]]
-            new_matrix_n=np.concatenate((sim_matrix_i2t_fusion[s_:e_],
-                                                  np.full((max_length-e_+s_, sim_matrix_i2t_fusion.shape[1]), -np.inf)), axis=0)
-            new_matrix_n_t2i=np.concatenate((sim_matrix_t2i_fusion[s_:e_],
-                                                  np.full((max_length-e_+s_, sim_matrix_t2i_fusion.shape[1]), -np.inf)), axis=0)
-            sim_matrix_new_i2t_fusion.append(new_matrix_n)
-            sim_matrix_new_t2i_fusion.append(new_matrix_n_t2i)
-
             new_matrix_n=np.concatenate((sim_matrix_i2t_pose[s_:e_],
                                                   np.full((max_length-e_+s_, sim_matrix_i2t_pose.shape[1]), -np.inf)), axis=0)
             new_matrix_n_t2i=np.concatenate((sim_matrix_t2i_pose[s_:e_],
@@ -640,37 +595,16 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
             sim_matrix_new_i2t_pose.append(new_matrix_n)
             sim_matrix_new_t2i_pose.append(new_matrix_n_t2i)
 
-            new_matrix_n=np.concatenate((sim_matrix_i2t_rgb[s_:e_],
-                                                  np.full((max_length-e_+s_, sim_matrix_i2t_rgb.shape[1]), -np.inf)), axis=0)
-            new_matrix_n_t2i=np.concatenate((sim_matrix_t2i_rgb[s_:e_],
-                                                  np.full((max_length-e_+s_, sim_matrix_t2i_rgb.shape[1]), -np.inf)), axis=0)
-            sim_matrix_new_i2t_rgb.append(new_matrix_n)
-            sim_matrix_new_t2i_rgb.append(new_matrix_n_t2i)
-
-        # shape: [sim_matrix_i2t.shape[1], max_length, sim_matrix_i2t.shape[1]]
-        sim_matrix_i2t_fusion = np.stack(tuple(sim_matrix_new_i2t_fusion), axis=0)
-        sim_matrix_t2i_fusion = np.stack(tuple(sim_matrix_new_t2i_fusion), axis=0)
         sim_matrix_i2t_pose = np.stack(tuple(sim_matrix_new_i2t_pose), axis=0)
         sim_matrix_t2i_pose = np.stack(tuple(sim_matrix_new_t2i_pose), axis=0)
-        sim_matrix_i2t_rgb = np.stack(tuple(sim_matrix_new_i2t_rgb), axis=0)
-        sim_matrix_t2i_rgb = np.stack(tuple(sim_matrix_new_t2i_rgb), axis=0)
 
         if args.do_eval:
             logger.info(f"after reshape, sim matrix save to {args.output_dir}")
-            pkl.dump(sim_matrix_i2t_fusion, open(os.path.join(args.output_dir, "sim_matrix_i2t_after.pkl"), 'wb'))
-            pkl.dump(sim_matrix_t2i_fusion, open(os.path.join(args.output_dir, "sim_matrix_t2i_after.pkl"), 'wb'))
+            pkl.dump(sim_matrix_i2t_pose, open(os.path.join(args.output_dir, "sim_matrix_i2t_after.pkl"), 'wb'))
+            pkl.dump(sim_matrix_t2i_pose, open(os.path.join(args.output_dir, "sim_matrix_t2i_after.pkl"), 'wb'))
 
         logger.info("after reshape, sim matrix size: {} x {} x {}".
-                    format(sim_matrix_i2t_fusion.shape[0], sim_matrix_i2t_fusion.shape[1], sim_matrix_i2t_fusion.shape[2]))
-
-        vt_metrics_fusion = tensor_text_to_video_metrics(sim_matrix_i2t_fusion)
-        tv_metrics_fusion = compute_metrics(tensor_video_to_text_sim(sim_matrix_t2i_fusion))
-        logger.info("Mix_Text-to-Video:")
-        logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
-                    format(tv_metrics_fusion['R1'], tv_metrics_fusion['R5'], tv_metrics_fusion['R10'], tv_metrics_fusion['MR'], tv_metrics_fusion['MeanR']))
-        logger.info("Mix_Video-to-Text:")
-        logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
-                    format(vt_metrics_fusion['R1'], vt_metrics_fusion['R5'], vt_metrics_fusion['R10'], vt_metrics_fusion['MR'], vt_metrics_fusion['MeanR']))
+                    format(sim_matrix_i2t_pose.shape[0], sim_matrix_i2t_pose.shape[1], sim_matrix_i2t_pose.shape[2]))
 
         vt_metrics = tensor_text_to_video_metrics(sim_matrix_i2t_pose)
         tv_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix_t2i_pose))
@@ -680,18 +614,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         logger.info("Pos_Video-to-Text:")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
-        
-        vt_metrics = tensor_text_to_video_metrics(sim_matrix_i2t_rgb)
-        tv_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix_t2i_rgb))
-        logger.info("RGB_Text-to-Video:")
-        logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
-                    format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
-        logger.info("RGB_Video-to-Text:")
-        logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
-                    format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
-
-
-    R1 = tv_metrics_fusion['R1']
+        R1 = tv_metrics['R1']
 
     end_time = time.time() 
     print("操作耗时：", (end_time - start_time)*1000, "毫秒")
@@ -760,6 +683,9 @@ def main():
         global_step = 0
         loss_record=[]
         acc_record=[]
+
+        train_start_time = time.time()
+
         for epoch in range(resumed_epoch, args.epochs):
             if args.distributed==True:
                 train_sampler.set_epoch(epoch)
@@ -784,6 +710,12 @@ def main():
 
                 if epoch == args.stop_epochs:
                     break
+
+        if args.local_rank == 0:
+            total_train_time = time.time() - train_start_time
+            logger.info("Total training time: %.2f seconds / %.2f hours",
+                        total_train_time,
+                        total_train_time / 3600)
 
     elif args.do_eval:
         if args.local_rank == 0:

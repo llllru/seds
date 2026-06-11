@@ -21,7 +21,6 @@ class H2_DataLoader_pose(Dataset):
             subset,
             data_path,
             features_path,
-            features_RGB_path,
             tokenizer,
             max_words=30,
             feature_len=64,
@@ -32,7 +31,6 @@ class H2_DataLoader_pose(Dataset):
     ):
         self.data_path = data_path
         self.features_path = features_path
-        self.features_RGB_path = features_RGB_path
         self.max_words = max_words
         self.tokenizer = tokenizer
         self.feature_len = feature_len
@@ -64,14 +62,12 @@ class H2_DataLoader_pose(Dataset):
 
         self.sample_len = 0
         self.video_dict = {}
-        self.video_RGB_dict = {}
         self.cut_off_points = []
 
         for sentance_id in sentance_ids:
             for video in captions[sentance_id]:
                 video_name=video['new_video_name']
                 self.video_dict[len(self.video_dict)] = (sentance_id, os.path.join(self.features_path, video_name)+'.pkl')
-                self.video_RGB_dict[len(self.video_RGB_dict)] = (sentance_id, os.path.join(os.path.join(self.features_RGB_path, subset), video_name)+'.pkl')
 
             self.cut_off_points.append(len(self.video_dict))
 
@@ -95,47 +91,12 @@ class H2_DataLoader_pose(Dataset):
 
     def __getitem__(self, idx):
 
-        video_feature, video_mask = self._get_rawvideo(idx)
         sample, sentance_id = self._get_pose(idx)
 
         sample_text = self._get_text(sentance_id)
         sample['text'] = sample_text
-        sample['RGB'] = video_feature
-        assert torch.sum(video_mask) == torch.sum(sample['right']['pose_mask']), print(torch.sum(video_mask), print(torch.sum(sample['right']['pose_mask'])), idx)
 
         return sample
-    
-    def _get_rawvideo(self, vedio_index):
-        feature_len = self.feature_len
-        item = self.video_RGB_dict[vedio_index]
-        _, video_file_path = item
-
-        video_feature = torch.zeros((1024, feature_len, 1))
-        video_mask = torch.ones(feature_len + 1, dtype=torch.long)
-        video_mask[0] = 0
-
-        with open(video_file_path, 'rb') as f:
-            item = pkl.load(f)
-            video_feature_pre = item['feature']
-
-        video_feature_pre=torch.Tensor(video_feature_pre).transpose(0, 1)
-        video_feature_pre=video_feature_pre.view(video_feature_pre.shape[0], -1, 1)
-
-        video_len=video_feature_pre.shape[1]
-
-
-        if video_len>=feature_len:
-            choosen_idx=range(video_len)
-            choosen_idx=list(choosen_idx)
-            ValueError("RGB data has problem!!!")
-        else:
-            choosen_idx=range(video_len)
-            choosen_idx=list(choosen_idx)
-        for i in range(len(choosen_idx)):
-            video_feature[:,i,:]=video_feature_pre[:,choosen_idx[i],:]
-            video_mask[i+1]=0
-
-        return video_feature, video_mask
 
     def _get_text(self, sentence_ids):
         k = 1
@@ -591,7 +552,6 @@ def H2_pose_collate_fn(batch, padding=6):
     :param padding: None
     :return: dict type, input data for SignBert model
     '''
-    batch_RGB = []
     batch_right = []
     batch_left = []
     batch_body = []
@@ -600,7 +560,6 @@ def H2_pose_collate_fn(batch, padding=6):
     batch_pairs_segment = []
 
     for i in range(len(batch)):
-        batch_RGB.append(batch[i]['RGB'])
         batch_right.append(batch[i]['right'])
         batch_left.append(batch[i]['left'])
         batch_body.append((batch[i]['body']))
@@ -648,7 +607,6 @@ def H2_pose_collate_fn(batch, padding=6):
     body_clips_start = torch.stack(body_clips_start, dim=0).long()
     body_mask = torch.stack(body_mask, dim=0).long()
 
-    RGB_feature = torch.stack(batch_RGB, dim=0).float()
     pairs_text = torch.stack(batch_pairs_text, dim=0).long()
     pairs_mask = torch.stack(batch_pairs_mask, dim=0).long()
     pairs_segment = torch.stack(batch_pairs_segment, dim=0).long()
@@ -656,5 +614,4 @@ def H2_pose_collate_fn(batch, padding=6):
     return {'right_pose': right_pose, 'right_clips_start':right_clips_start,
             'left_pose': left_pose, 'left_clips_start':left_clips_start,
             'body_pose': body_pose,  'body_mask': body_mask, 'body_clips_start':body_clips_start,
-            'RGB_feature': RGB_feature,
             'pairs_text':pairs_text, 'pairs_mask':pairs_mask, 'pairs_segment':pairs_segment,}

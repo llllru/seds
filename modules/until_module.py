@@ -147,17 +147,12 @@ class PreTrainedModel(nn.Module):
             logger.info("-" * 20)
 
             missing_signbert_keys = [key for key in missing_keys if key.find('singbert') > -1 ]
-            missing_rgb_keys = [key for key in missing_keys if key.find('clip_rgb') > -1 ]
-
             if len(missing_keys) > 0:
                 logger.info("Weights of {} not initialized from pretrained model: {}"
                             .format(model.__class__.__name__, "\n   " + "\n   ".join(missing_keys)))
             if len(missing_signbert_keys) > 0:
                 logger.info("Weights of {} not initialized from pretrained model: {}"
                             .format(model.__class__.__name__, "\n   " + "\n   ".join(missing_signbert_keys)))
-            if len(missing_rgb_keys) > 0:
-                logger.info("Weights of {} not initialized from pretrained model: {}"
-                            .format(model.__class__.__name__, "\n   " + "\n   ".join(missing_rgb_keys)))
             if len(unexpected_keys) > 0:
                 logger.info("Weights from pretrained model not used in {}: {}"
                             .format(model.__class__.__name__, "\n   " + "\n   ".join(unexpected_keys)))

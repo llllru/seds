@@ -11,7 +11,6 @@ import pickle as pkl
 import random
 import math
 
-from textaugment import EDA
 from random import choice
 
 LEN_KPS = 10
@@ -24,7 +23,6 @@ class csl_DataLoader_train_pose(Dataset):
             subset,
             data_path,
             features_path,
-            features_RGB_path,
             tokenizer,
             max_words=30,
             feature_len=64,
@@ -35,7 +33,6 @@ class csl_DataLoader_train_pose(Dataset):
     ):
         self.data_path = data_path
         self.features_path = features_path
-        self.features_RGB_path = features_RGB_path
         self.max_words = max_words
         self.tokenizer = tokenizer
         self.feature_len = feature_len
@@ -57,7 +54,7 @@ class csl_DataLoader_train_pose(Dataset):
             captions = pkl.load(f)
 
         self.captions=captions
-        self.emd = EDA()
+        self.emd = None
         self.text_aug_choosen=args.text_aug_choosen
 
         sentance_ids = captions.keys()
@@ -69,21 +66,17 @@ class csl_DataLoader_train_pose(Dataset):
 
         self.sample_len = 0
         self.video_dict = {}
-        self.video_RGB_dict = {}
         self.cut_off_points = []
         video_num=0
 
         for sentance_id in sentance_ids:
             for i_video in range(len(captions[sentance_id])):
                 video_path=os.path.join(self.features_path, captions[sentance_id][i_video]['video_name']+'.pkl')
-                video_RGB_path=os.path.join(os.path.join(self.features_RGB_path, subset), captions[sentance_id][i_video]['video_name']+'.pkl')
 
                 if sentance_id not in self.video_dict:
                     self.video_dict[sentance_id]=[video_path]
-                    self.video_RGB_dict[sentance_id]=[video_RGB_path]
                 else:
                     self.video_dict[sentance_id].append(video_path)
-                    self.video_RGB_dict[sentance_id].append(video_RGB_path)
 
             video_num+=len(captions[sentance_id])
             self.cut_off_points.append(video_num)
@@ -109,48 +102,31 @@ class csl_DataLoader_train_pose(Dataset):
     def __getitem__(self, idx):
 
         sample_text, choice_sentance_ids = self._get_text(idx)
-        video_feature, video_mask, video_file_path = self._get_rawvideo(choice_sentance_ids)
+        video_file_path = self._choose_video_path(choice_sentance_ids)
 
         sample = self._get_pose(video_file_path)
         sample['text'] = sample_text
-        sample['RGB'] = video_feature
-        assert torch.sum(video_mask) == torch.sum(sample['right']['pose_mask']), print(torch.sum(video_mask), print(torch.sum(sample['right']['pose_mask'])), video_file_path)
 
         return sample
     
-    def _get_rawvideo(self, sentance_id):
-        videos=self.video_RGB_dict[sentance_id]
-        feature_len=self.feature_len
+    def _choose_video_path(self, sentance_id):
+        videos=self.video_dict[sentance_id]
         rands = random.randint(0, len(videos) - 1)
-        video_file_path=videos[rands]
+        return videos[rands]
 
-        video_feature = torch.zeros((1024, feature_len, 1))
-        video_mask = torch.ones(feature_len + 1, dtype=torch.long)
-        video_mask[0] = 0
-
-        with open(video_file_path, 'rb') as f:
-            item = pkl.load(f)
-            video_feature_pre = item['feature']
-
-        video_feature_pre=torch.Tensor(video_feature_pre).transpose(0, 1)
-        video_feature_pre=video_feature_pre.view(video_feature_pre.shape[0], -1, 1)
-
-        video_len=video_feature_pre.shape[1]
-
-        if video_len>=feature_len:
-            choosen_idx=range(video_len)
-            choosen_idx=list(choosen_idx)
-            ValueError("RGB data has problem!!!")
-        else:
-            choosen_idx=range(video_len)
-            choosen_idx=list(choosen_idx)
-
-        for i in range(len(choosen_idx)):
-            video_feature[:,i,:]=video_feature_pre[:,choosen_idx[i],:]
-            video_mask[i+1]=0
-
-
-        return video_feature, video_mask, video_file_path
+    def _get_eda(self):
+        if self.emd is None:
+            import nltk
+            from textaugment import EDA
+            nltk.data.find("corpora/stopwords")
+            nltk.data.find("corpora/wordnet")
+            nltk_download = nltk.download
+            nltk.download = lambda *args, **kwargs: True
+            try:
+                self.emd = EDA()
+            finally:
+                nltk.download = nltk_download
+        return self.emd
 
     def _get_text(self, ids):
         k = 1
@@ -170,14 +146,15 @@ class csl_DataLoader_train_pose(Dataset):
                 choose_porb = 0.8
             if self.text_aug==True and random.random()>1-choose_porb:
                 is_aug=1
+                emd = self._get_eda()
                 if self.text_aug_choosen=='synonym_replacement':
-                    emd_aug=self.emd.synonym_replacement
+                    emd_aug=emd.synonym_replacement
                 elif self.text_aug_choosen=='random_swap':
-                    emd_aug=self.emd.random_swap
+                    emd_aug=emd.random_swap
                 elif self.text_aug_choosen=='random_deletion':
-                    emd_aug=self.emd.random_deletion
+                    emd_aug=emd.random_deletion
                 else:
-                    emd_aug = choice([self.emd.synonym_replacement, self.emd.random_swap, self.emd.random_deletion])
+                    emd_aug = choice([emd.synonym_replacement, emd.random_swap, emd.random_deletion])
                 text_aug = emd_aug(text)
                 if isinstance(text_aug, list):
                     text_aug = ' '.join(text_aug)
@@ -650,7 +627,6 @@ def csl_train_pose_collate_fn(batch, padding=6):
     :param padding: None
     :return: dict type, input data for SignBert model
     '''
-    batch_RGB = []
     batch_right = []
     batch_left = []
     batch_body = []
@@ -661,7 +637,6 @@ def csl_train_pose_collate_fn(batch, padding=6):
     batch_pairs_mask_aug = []
 
     for i in range(len(batch)):
-        batch_RGB.append(batch[i]['RGB'])
         batch_right.append(batch[i]['right'])
         batch_left.append(batch[i]['left'])
         batch_body.append((batch[i]['body']))
@@ -711,7 +686,6 @@ def csl_train_pose_collate_fn(batch, padding=6):
     body_clips_start = torch.stack(body_clips_start, dim=0).long()
     body_mask = torch.stack(body_mask, dim=0).long()
 
-    RGB_feature = torch.stack(batch_RGB, dim=0).float()
     pairs_text = torch.stack(batch_pairs_text, dim=0).long()
     pairs_mask = torch.stack(batch_pairs_mask, dim=0).long()
     pairs_segment = torch.stack(batch_pairs_segment, dim=0).long()
@@ -721,5 +695,4 @@ def csl_train_pose_collate_fn(batch, padding=6):
     return {'right_pose': right_pose, 'right_clips_start':right_clips_start,
             'left_pose': left_pose, 'left_clips_start':left_clips_start,
             'body_pose': body_pose,  'body_mask': body_mask, 'body_clips_start':body_clips_start,
-            'RGB_feature': RGB_feature,
             'pairs_text':pairs_text, 'pairs_mask':pairs_mask, 'pairs_segment':pairs_segment, 'pairs_text_aug':pairs_text_aug, 'pairs_mask_aug':pairs_mask_aug}
