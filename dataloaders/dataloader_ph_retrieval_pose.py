@@ -41,6 +41,8 @@ class ph_DataLoader_pose(Dataset):
         self.max_length_frames = max_length_frames
         self.threshold = args.threshold
         self.frames_threshold = args.frames_threshold
+        self.original_size_w = args.original_size_w
+        self.original_size_h = args.original_size_h
         self.crop_img_size = np.array([[args.crop_size, args.crop_size]], dtype=np.float32)
 
         assert self.subset in ["train", "dev", "test"]
@@ -66,7 +68,7 @@ class ph_DataLoader_pose(Dataset):
         for sentance_id in sentance_ids:
             video=captions[sentance_id]
             video_name=video['video_name']
-            self.video_dict[len(self.video_dict)] = (sentance_id, os.path.join(self.features_path, video_name)+'.pkl')
+            self.video_dict[len(self.video_dict)] = (sentance_id, self._build_feature_path(video_name))
 
             self.cut_off_points.append(len(self.video_dict))
 
@@ -87,6 +89,13 @@ class ph_DataLoader_pose(Dataset):
 
     def __len__(self):
         return self.sample_len
+
+    def _build_feature_path(self, video_name):
+        feature_name = video_name + '.npy'
+        split_path = os.path.join(self.features_path, self.subset, feature_name)
+        if os.path.exists(split_path):
+            return split_path
+        return os.path.join(self.features_path, feature_name)
 
     def __getitem__(self, idx):
 
@@ -205,8 +214,13 @@ class ph_DataLoader_pose(Dataset):
     def _get_pose(self, ids):
         sentance_id, video_file_path = self.video_dict[ids]
 
-        video_data = pkl.load(open(video_file_path, 'rb'))
-        ori_img_size = np.array([210, 260], dtype=np.float32)
+        keypoints = np.load(video_file_path, allow_pickle=True).astype(np.float32)
+        keypoints[:, :, 2] = np.clip(keypoints[:, :, 2] / 10.0, 0.0, 1.0)
+        video_data = {
+            'keypoints': keypoints,
+            'img_list': [f'image_{i:05d}.png' for i in range(len(keypoints))],
+        }
+        ori_img_size = np.array([self.original_size_w, self.original_size_h], dtype=np.float32)
         total_frame_list = self.GetTotalFrameList(video_data, ori_img_size)
 
         sample = {}
