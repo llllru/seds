@@ -6,6 +6,15 @@ from torch.autograd import Variable
 import numpy as np
 from modules.modeling_graph import Graph, Graph_pool
 
+
+def build_topology_adjacency(base_adjacency, residual_adjacency, enabled, scale, residual_mask=None):
+    if not enabled:
+        return base_adjacency
+    if residual_mask is not None:
+        residual_adjacency = residual_adjacency * residual_mask
+    return base_adjacency + scale * residual_adjacency
+
+
 class TemporalConvNetBlock(nn.Module):
     def __init__(self, num_inputs, num_outputs, dropout=0.0):
         super(TemporalConvNetBlock, self).__init__()
@@ -115,13 +124,31 @@ class st_gcn(nn.Module):
                  kernel_size,
                  stride=1,
                  dropout=0.05,
-                 residual=True):
+                 residual=True,
+                 semantic_interaction=False,
+                 semantic_interaction_mask=None,
+                 sie_alpha=0.0):
 
         super(st_gcn,self).__init__()
         self.inplace = True
 
         self.momentum = 0.1
+        self.semantic_interaction = semantic_interaction
         self.gcn = ConvTemporalGraphical(in_channels, out_channels, kernel_size)
+        if semantic_interaction:
+            self.sie_mlp = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            )
+            self.sie_alpha = nn.Parameter(torch.tensor(float(sie_alpha)))
+        else:
+            self.sie_mlp = None
+            self.register_buffer('sie_alpha', torch.tensor(0.0))
+        if semantic_interaction_mask is None:
+            self.register_buffer('semantic_interaction_mask', None)
+        else:
+            self.register_buffer('semantic_interaction_mask', semantic_interaction_mask.float())
 
         self.tcn = nn.Sequential(
 
@@ -159,10 +186,23 @@ class st_gcn(nn.Module):
 
         self.relu = nn.ReLU(inplace=self.inplace)
 
+    def apply_semantic_interaction(self, x):
+        r_mean = x.mean(dim=2, keepdim=True)
+        rel = r_mean.unsqueeze(-1) - r_mean.unsqueeze(-2)
+        rel = rel.squeeze(2)
+        bias = self.sie_mlp(rel)
+        if self.semantic_interaction_mask is not None:
+            mask = self.semantic_interaction_mask.to(device=bias.device, dtype=bias.dtype)
+            bias = bias * mask.unsqueeze(0).unsqueeze(0)
+        return bias.sum(dim=-1).unsqueeze(2)
+
     def forward(self, x, A):
 
         res = self.residual(x)
+        gcn_input = x
         x, A = self.gcn(x, A.to(x.device))
+        if self.semantic_interaction:
+            x = x + self.sie_alpha * self.apply_semantic_interaction(gcn_input)
 
         x = self.tcn(x) + res
 
@@ -253,16 +293,35 @@ class ST_GCN_Model(nn.Module):
         self.cat = True
         self.inplace = True
         self.pad = opt.temporal_pad
+        self.learnable_topology = getattr(opt, 'learnable_topology', False)
+        self.topology_res_scale = getattr(opt, 'topology_res_scale', 0.1)
+        self.tip_graph = getattr(opt, 'tip_graph', False) and self.layout == 'stb'
+        self.semantic_interaction = getattr(opt, 'semantic_interaction', False) and self.layout == 'stb'
+        self.sie_alpha_init = getattr(opt, 'sie_alpha', 0.0)
 
         # original graph
-        self.graph = Graph(self.layout, self.strategy, pad=opt.temporal_pad)
+        self.graph = Graph(self.layout, self.strategy, pad=opt.temporal_pad, include_tip=self.tip_graph)
         # get adjacency matrix of K clusters
-        A = torch.tensor(self.graph.A, dtype=torch.float32, requires_grad=False).cuda()  # K
+        A = torch.tensor(self.graph.A, dtype=torch.float32, requires_grad=False)  # K
         self.register_buffer('A', A)
+        A_res_mask = torch.tensor(self.graph.residual_mask, dtype=torch.float32, requires_grad=False).unsqueeze(0)
+        self.register_buffer('A_res_mask', A_res_mask)
+        semantic_interaction_mask = torch.tensor(self.graph.semantic_interaction_mask, dtype=torch.float32, requires_grad=False)
+        self.register_buffer('semantic_interaction_mask', semantic_interaction_mask)
+        if self.learnable_topology:
+            self.A_res = nn.Parameter(torch.zeros_like(A))
+        else:
+            self.register_buffer('A_res', torch.zeros_like(A))
         # pooled graph
         self.graph_pool = Graph_pool(self.layout, self.strategy, pad=opt.temporal_pad)
-        A_pool = torch.tensor(self.graph_pool.A, dtype=torch.float32, requires_grad=False).cuda()
+        A_pool = torch.tensor(self.graph_pool.A, dtype=torch.float32, requires_grad=False)
         self.register_buffer('A_pool', A_pool)
+        A_pool_res_mask = torch.tensor(self.graph_pool.residual_mask, dtype=torch.float32, requires_grad=False).unsqueeze(0)
+        self.register_buffer('A_pool_res_mask', A_pool_res_mask)
+        if self.learnable_topology:
+            self.A_pool_res = nn.Parameter(torch.zeros_like(A_pool))
+        else:
+            self.register_buffer('A_pool_res', torch.zeros_like(A_pool))
 
         # build networks, K=4 subset: self, to close, to far, sym same joints
         kernel_size = self.A.size(0)
@@ -276,9 +335,18 @@ class ST_GCN_Model(nn.Module):
         self.fc_unit = 512
 
         self.st_gcn_networks = nn.ModuleList((
-            st_gcn(self.in_channels, self.inter_channels[0], kernel_size, residual=False),
-            st_gcn(self.inter_channels[0], self.inter_channels[1], kernel_size),
-            st_gcn(self.inter_channels[1], self.inter_channels[2], kernel_size),
+            st_gcn(self.in_channels, self.inter_channels[0], kernel_size, residual=False,
+                   semantic_interaction=self.semantic_interaction,
+                   semantic_interaction_mask=self.semantic_interaction_mask,
+                   sie_alpha=self.sie_alpha_init),
+            st_gcn(self.inter_channels[0], self.inter_channels[1], kernel_size,
+                   semantic_interaction=self.semantic_interaction,
+                   semantic_interaction_mask=self.semantic_interaction_mask,
+                   sie_alpha=self.sie_alpha_init),
+            st_gcn(self.inter_channels[1], self.inter_channels[2], kernel_size,
+                   semantic_interaction=self.semantic_interaction,
+                   semantic_interaction_mask=self.semantic_interaction_mask,
+                   sie_alpha=self.sie_alpha_init),
         ))
 
 
@@ -330,9 +398,10 @@ class ST_GCN_Model(nn.Module):
         x = x.view(N * M, C, 1, -1)  # (batch * sequence * 1, coordination, 1, num_joint)
 
         # forwad GCN
+        A = build_topology_adjacency(self.A, self.A_res, self.learnable_topology, self.topology_res_scale, self.A_res_mask)
         gcn_list = list(self.st_gcn_networks)
         for i_gcn, gcn in enumerate(gcn_list):
-            x, _ = gcn(x, self.A) # (N * M), C, 1, (T*V) 
+            x, _ = gcn(x, A) # (N * M), C, 1, (T*V) 
 
         x = x.view(N, -1, T, V)  # N, C, T ,V (batch * sequence, channel, 1, num_joint)
 
@@ -343,8 +412,9 @@ class ST_GCN_Model(nn.Module):
             x_i = self.graph_max_pool(x_i, (1, num_node))
             x_sub1 = torch.cat((x_sub1, x_i), -1) if i > 0 else x_i # Final to N, C, T, (NUM_SUB_PARTS) (batch * sequence, channel, NUM_SUB_PARTS)
 
-        x_sub1, _ = self.st_gcn_pool[0](x_sub1.view(N, -1, 1, T*len(self.graph.part)), self.A_pool.clone())  # N, 512, 1, (T*NUM_SUB_PARTS)
-        x_sub1, _ = self.st_gcn_pool[1](x_sub1, self.A_pool.clone())  # N, 512, 1, (T*NUM_SUB_PARTS)
+        A_pool = build_topology_adjacency(self.A_pool, self.A_pool_res, self.learnable_topology, self.topology_res_scale, self.A_pool_res_mask)
+        x_sub1, _ = self.st_gcn_pool[0](x_sub1.view(N, -1, 1, T*len(self.graph.part)), A_pool.clone())  # N, 512, 1, (T*NUM_SUB_PARTS)
+        x_sub1, _ = self.st_gcn_pool[1](x_sub1, A_pool.clone())  # N, 512, 1, (T*NUM_SUB_PARTS)
         x_sub1 = x_sub1.view(N, -1, T, len(self.graph.part)) # N, 512, T=1, (NUM_SUB_PARTS)
 
         x_pool_1 = self.graph_max_pool(x_sub1, (1, len(self.graph.part)))  # N, 512, T, 1

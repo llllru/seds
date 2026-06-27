@@ -16,11 +16,13 @@ class Graph():
                  strategy,
                  pad=0,
                  max_hop=1,
-                 dilation=1):
+                 dilation=1,
+                 include_tip=False):
 
         self.max_hop = max_hop
         self.dilation = dilation
         self.seqlen = 2*pad+1
+        self.include_tip = include_tip
         # get adjacency list
         self.get_edge(layout)
         # get adjacency matrix with distance by adjacency list and max_hop, value is [0,1==max_hop,inf]
@@ -31,6 +33,8 @@ class Graph():
 
         # get adjacency matrix with normalize
         self.get_adjacency(strategy)
+        self.residual_mask = self.get_inter_component_mask()
+        self.semantic_interaction_mask = self.get_semantic_interaction_mask()
 
     def get_distance_to_center(self,layout):
         """
@@ -93,8 +97,55 @@ class Graph():
 
         # symmetry connection, index - 1
         self.sym_link_all = self.graph_link_between_frames(sym_base)
+        self.tip_link_all = []
 
         return self_link, time_link
+
+    def get_component_labels(self):
+        labels = np.zeros(self.num_node, dtype=np.int64)
+        for part_idx, part in enumerate(self.part):
+            for frame_idx in range(self.seqlen):
+                offset = frame_idx * self.num_node_each
+                for node_idx in part:
+                    labels[offset + node_idx] = part_idx
+        return labels
+
+    def get_frame_labels(self):
+        labels = np.zeros(self.num_node, dtype=np.int64)
+        for frame_idx in range(self.seqlen):
+            start = frame_idx * self.num_node_each
+            labels[start:start + self.num_node_each] = frame_idx
+        return labels
+
+    def links_to_mask(self, links, include_reverse=True):
+        mask = np.zeros((self.num_node, self.num_node), dtype=np.float32)
+        for src, dst in links:
+            mask[src, dst] = 1.0
+            if include_reverse:
+                mask[dst, src] = 1.0
+        return mask
+
+    def get_inter_component_mask(self):
+        component_labels = self.get_component_labels()
+        frame_labels = self.get_frame_labels()
+        different_component = component_labels[:, None] != component_labels[None, :]
+        same_frame = frame_labels[:, None] == frame_labels[None, :]
+        fixed_links = (
+            self_link_from_num_node(self.num_node)
+            + self.neighbour_link_all
+            + self.sym_link_all
+            + self.tip_link_all
+            + self.time_link_forward
+            + self.time_link_back
+        )
+        fixed_mask = self.links_to_mask(fixed_links)
+        return (different_component & same_frame & (fixed_mask == 0)).astype(np.float32)
+
+    def get_semantic_interaction_mask(self):
+        fixed_semantic_mask = self.links_to_mask(
+            self.neighbour_link_all + self.sym_link_all + self.tip_link_all
+        )
+        return np.maximum(fixed_semantic_mask, self.residual_mask).astype(np.float32)
 
     def get_edge(self, layout):
         """
@@ -115,8 +166,12 @@ class Graph():
                         (19, 15), (15, 11), (11, 7), (7, 3),
                         (20, 16), (16, 12), (12, 8), (8, 4),
                         (21, 17), (17, 13), (13, 9), (9, 5)]
+            # thumb-index tip is already present in sym_base as (8, 4).
+            tip_base = [(4, 12), (4, 16), (4, 20)]
 
             self_link, time_link = self.basic_layout(neighbour_base, sym_base)
+            if self.include_tip:
+                self.tip_link_all = self.graph_link_between_frames(tip_base)
 
             self.little_finger = [18,19,20]
             self.ring_finger = [14,15,16]
@@ -127,7 +182,7 @@ class Graph():
             self.part = [self.thumb_finger ,self.index_finger, self.mid_finger, self.ring_finger, self.little_finger, self.cb]
 
             # self connection, neigh connection, symmetry connection, []
-            self.edge = self_link + self.neighbour_link_all + self.sym_link_all + time_link
+            self.edge = self_link + self.neighbour_link_all + self.sym_link_all + self.tip_link_all + time_link
 
             # center node of body/hand
             self.center = 0
@@ -145,7 +200,7 @@ class Graph():
             self.left_arm = [1, 2, 3]
             self.right_arm = [4, 5, 6]
             self.part = [self.left_arm, self.right_arm, self.nose]
-            self.edge = self_link + self.neighbour_link_all + self.sym_link_all + time_link
+            self.edge = self_link + self.neighbour_link_all + self.sym_link_all + self.tip_link_all + time_link
 
             # center node of body/hand
             self.center = 0
@@ -169,12 +224,15 @@ class Graph():
                 a_close = np.zeros((self.num_node, self.num_node))
                 a_further = np.zeros((self.num_node, self.num_node))
                 a_sym = np.zeros((self.num_node, self.num_node))
+                a_tip = np.zeros((self.num_node, self.num_node))
                 a_forward = np.zeros((self.num_node, self.num_node))
                 a_back = np.zeros((self.num_node, self.num_node))
                 for i in range(self.num_node):
                     for j in range(self.num_node):
                         if self.hop_dis[j, i] == hop:
-                            if (j,i) in self.sym_link_all or (i,j) in self.sym_link_all:
+                            if (j,i) in self.tip_link_all or (i,j) in self.tip_link_all:
+                                a_tip[j, i] = normalize_adjacency[j, i]
+                            elif (j,i) in self.sym_link_all or (i,j) in self.sym_link_all:
                                 a_sym[j, i] = normalize_adjacency[j, i]
                             elif (j,i) in self.time_link_forward:
                                 a_forward[j, i] = normalize_adjacency[j, i]
@@ -192,6 +250,8 @@ class Graph():
                     A.append(a_close)
                     A.append(a_further)
                     A.append(a_sym)
+                    if self.include_tip:
+                        A.append(a_tip)
                     if self.seqlen > 1:
                         A.append(a_forward)
                         A.append(a_back)
@@ -229,6 +289,8 @@ class Graph_pool():
         # get distance of each node to center
         self.dist_center = self.get_distance_to_center(layout)
         self.get_adjacency(strategy)
+        self.residual_mask = self.get_inter_component_mask()
+        self.semantic_interaction_mask = self.get_semantic_interaction_mask()
 
     def get_distance_to_center(self,layout):
         """
@@ -252,6 +314,47 @@ class Graph_pool():
         :return:
         """
         return [((front ) + i*self.num_node_each, (back )+ i*self.num_node_each) for i in range(self.seqlen) for (front, back) in base]
+
+    def get_component_labels(self):
+        labels = np.zeros(self.num_node, dtype=np.int64)
+        for frame_idx in range(self.seqlen):
+            start = frame_idx * self.num_node_each
+            labels[start:start + self.num_node_each] = np.arange(self.num_node_each)
+        return labels
+
+    def get_frame_labels(self):
+        labels = np.zeros(self.num_node, dtype=np.int64)
+        for frame_idx in range(self.seqlen):
+            start = frame_idx * self.num_node_each
+            labels[start:start + self.num_node_each] = frame_idx
+        return labels
+
+    def links_to_mask(self, links, include_reverse=True):
+        mask = np.zeros((self.num_node, self.num_node), dtype=np.float32)
+        for src, dst in links:
+            mask[src, dst] = 1.0
+            if include_reverse:
+                mask[dst, src] = 1.0
+        return mask
+
+    def get_inter_component_mask(self):
+        component_labels = self.get_component_labels()
+        frame_labels = self.get_frame_labels()
+        different_component = component_labels[:, None] != component_labels[None, :]
+        same_frame = frame_labels[:, None] == frame_labels[None, :]
+        fixed_links = (
+            self_link_from_num_node(self.num_node)
+            + self.neighbour_link_all
+            + self.sym_link_all
+            + self.time_link_forward
+            + self.time_link_back
+        )
+        fixed_mask = self.links_to_mask(fixed_links)
+        return (different_component & same_frame & (fixed_mask == 0)).astype(np.float32)
+
+    def get_semantic_interaction_mask(self):
+        fixed_semantic_mask = self.links_to_mask(self.neighbour_link_all + self.sym_link_all)
+        return np.maximum(fixed_semantic_mask, self.residual_mask).astype(np.float32)
 
     def get_edge(self, layout):
 
@@ -377,6 +480,10 @@ def get_hop_distance(num_node, edge, max_hop=1):
     for d in range(max_hop, -1, -1): # preserve A(i,j) = 1 while A(i,i) = 0
         hop_dis[arrive_mat[d]] = d
     return hop_dis
+
+
+def self_link_from_num_node(num_node):
+    return [(i, i) for i in range(num_node)]
 
 
 def normalize_digraph(A):

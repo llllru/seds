@@ -11,6 +11,7 @@ main_task_retrieval.py --do_eval \
 --lr 1e-5 --sign_lr 1e-4 \
 --max_words 32 --feature_len 64 --max_length_frames 300 \
 --slide_windows 16 --windows_stride 1 \
+--learnable_topology --topology_res_scale 0.1 \
 --original_size_w 384 --original_size_h 288 \
 --crop_size 256 --frames_threshold 0.1 --threshold 0.4 \
 --batch_size_val 64 \

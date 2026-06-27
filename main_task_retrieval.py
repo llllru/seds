@@ -127,6 +127,8 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument('--layout_encoder', default='stb', type=str, help='')
     parser.add_argument('--strategy', default='spatial', type=str, help='')
     parser.add_argument('--temporal_pad', default=0, type=int, help='the connection of temporal dimension ')
+    parser.add_argument('--learnable_topology', action='store_true', help='whether to add learnable residual topology to fixed skeleton graph')
+    parser.add_argument('--topology_res_scale', type=float, default=0.1, help='scale for learnable residual topology')
     ##########  SignBert paras   ##########
 
     parser.add_argument('--data_path', type=str, default='data_h2', help='data pickle file path')
