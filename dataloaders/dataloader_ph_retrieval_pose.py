@@ -10,6 +10,12 @@ import numpy as np
 import pickle as pkl
 import random
 import math
+from dataloaders.i3d_feature_utils import (
+    align_sample_with_i3d_features,
+    collate_i3d_features,
+    get_i3d_feature_roots,
+    load_i3d_feature_dict,
+)
 
 LEN_KPS = 10
 THRE = 0.5
@@ -44,6 +50,7 @@ class ph_DataLoader_pose(Dataset):
         self.original_size_w = args.original_size_w
         self.original_size_h = args.original_size_h
         self.crop_img_size = np.array([[args.crop_size, args.crop_size]], dtype=np.float32)
+        self.i3d_feature_roots = get_i3d_feature_roots(args)
 
         assert self.subset in ["train", "dev", "test"]
         sentance_id_path_dict = {}
@@ -213,6 +220,7 @@ class ph_DataLoader_pose(Dataset):
 
     def _get_pose(self, ids):
         sentance_id, video_file_path = self.video_dict[ids]
+        video_name = os.path.splitext(os.path.basename(video_file_path))[0]
 
         keypoints = np.load(video_file_path, allow_pickle=True).astype(np.float32)
         keypoints[:, :, 2] = np.clip(keypoints[:, :, 2] / 10.0, 0.0, 1.0)
@@ -239,6 +247,10 @@ class ph_DataLoader_pose(Dataset):
 
         assert torch.sum(sample['right']['pose_mask']) == torch.sum(sample['left']['pose_mask']) == torch.sum(sample['body']['pose_mask'])
         assert torch.sum(sample['right']['clips_start']) == torch.sum(sample['left']['clips_start']) == torch.sum(sample['body']['clips_start'])
+
+        if self.i3d_feature_roots:
+            i3d_features = load_i3d_feature_dict(self.i3d_feature_roots, self.subset, video_name)
+            align_sample_with_i3d_features(sample, i3d_features, self.feature_len)
 
         return sample, sentance_id
     
@@ -634,8 +646,11 @@ def ph_pose_collate_fn(batch, padding=6):
     pairs_text = torch.stack(batch_pairs_text, dim=0).long()
     pairs_mask = torch.stack(batch_pairs_mask, dim=0).long()
     pairs_segment = torch.stack(batch_pairs_segment, dim=0).long()
+    i3d_batch = collate_i3d_features(batch)
 
-    return {'right_pose': right_pose, 'right_clips_start':right_clips_start,
+    result = {'right_pose': right_pose, 'right_clips_start':right_clips_start,
             'left_pose': left_pose, 'left_clips_start':left_clips_start,
             'body_pose': body_pose,  'body_mask': body_mask, 'body_clips_start':body_clips_start,
             'pairs_text':pairs_text, 'pairs_mask':pairs_mask, 'pairs_segment':pairs_segment,}
+    result.update(i3d_batch)
+    return result

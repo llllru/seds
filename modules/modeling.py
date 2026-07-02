@@ -84,6 +84,34 @@ def update_attr(target_name, target_config, target_attr_name, source_config, sou
 def check_attr(target_name, task_config):
     return hasattr(task_config, target_name) and task_config.__dict__[target_name]
 
+
+class GatedFusion(nn.Module):
+    def __init__(self, pose_dim, i3d_dim, hidden_dim, dropout=0.1):
+        super(GatedFusion, self).__init__()
+        self.pose_proj = nn.Linear(pose_dim, hidden_dim)
+        self.i3d_proj = nn.Linear(i3d_dim, hidden_dim)
+        self.gate = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, pose_feat, i3d_feat):
+        pose_feat = self.pose_proj(pose_feat)
+        i3d_feat = self.i3d_proj(i3d_feat)
+        gate = torch.sigmoid(self.gate(torch.cat([pose_feat, i3d_feat], dim=-1)))
+        fused = gate * i3d_feat + (1.0 - gate) * pose_feat
+        return self.norm(self.dropout(fused))
+
+
+class PartAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super(PartAttention, self).__init__()
+        self.score = nn.Linear(hidden_dim, 1)
+
+    def forward(self, part_features):
+        # part_features: [B, T, P, H]
+        weight = torch.softmax(self.score(part_features), dim=2)
+        return torch.sum(weight * part_features, dim=2)
+
 class CLIP4Clip(CLIP4ClipPreTrainedModel):
     def __init__(self, cross_config, clip_state_dict, task_config):
         super(CLIP4Clip, self).__init__(cross_config)
@@ -172,6 +200,16 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         if self.signbert_have:
             self.signbert = init_sign_model(args=task_config)
 
+        self.use_i3d_local_features = getattr(task_config, "use_i3d_local_features", False)
+        i3d_dim = getattr(task_config, "video_dim", 1024)
+        part_pose_dim = getattr(task_config, "hidden_dim", 512)
+        fusion_dim = getattr(task_config, "hidden_dim", 512)
+        self.left_i3d_fusion = GatedFusion(part_pose_dim, i3d_dim, fusion_dim, task_config.dropout)
+        self.right_i3d_fusion = GatedFusion(part_pose_dim, i3d_dim, fusion_dim, task_config.dropout)
+        self.body_i3d_fusion = GatedFusion(part_pose_dim, i3d_dim, fusion_dim, task_config.dropout)
+        self.part_attention = PartAttention(fusion_dim)
+        self.i3d_fusion_output = nn.Linear(fusion_dim, task_config.pose_dim)
+
         self.loss_fct = CrossEn()
 
         self.apply(self.init_weights)
@@ -226,19 +264,34 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         clip_mask = body_batch['mask']
         batch_num, feature_len = clips_start.size()
         slide_windows = self.task_config.slide_windows
+        right_i3d = right_batch.get('i3d')
+        left_i3d = left_batch.get('i3d')
+        body_i3d = body_batch.get('i3d')
         
         pose_all = {}
         pose_all['right'] = right_batch['pose']
         pose_all['left'] = left_batch['pose']
         pose_all['body'] = body_batch['pose']
 
+        pose_all = self.signbert.gcn_emb(pose_all)
+
+        if self.use_i3d_local_features and right_i3d is not None and left_i3d is not None and body_i3d is not None:
+            pose_final_new = self.get_i3d_fused_sign_output(
+                pose_all,
+                clips_start,
+                slide_windows,
+                left_i3d,
+                right_i3d,
+                body_i3d,
+            )
+            return pose_final_new, clip_mask
+
         del right_batch, left_batch, body_batch
         torch.cuda.empty_cache()
 
-        pose_all = self.signbert.gcn_emb(pose_all)
         batch_num, seq_length, feat_dim = pose_all['feat'].size()
         pose_final_new = torch.zeros((batch_num, feature_len, slide_windows, feat_dim)).to(device=pose_all['feat'].device, dtype=pose_all['feat'].dtype)
-
+        # [B, 64, 16, 1536]表示把整段pose序列切成clip窗口后的pose特征。
         for i in range(batch_num):
             for j in range(feature_len):
                 if clips_start[i, j] != -1:
@@ -259,6 +312,50 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         pose_final_new = pose_final_new.permute(0, 2, 1).unsqueeze(-1)
         
         return pose_final_new, clip_mask
+
+    def collect_part_clip_features(self, part_feat, clips_start, slide_windows):
+        batch_num, feature_len = clips_start.size()
+        feat_dim = part_feat.size(-1)
+        part_clip_feat = torch.zeros((batch_num, feature_len, feat_dim)).to(
+            device=part_feat.device,
+            dtype=part_feat.dtype,
+        )
+        for i in range(batch_num):
+            for j in range(feature_len):
+                if clips_start[i, j] != -1:
+                    start = int(clips_start[i, j].item())
+                    part_clip_feat[i, j] = torch.mean(part_feat[i, start:start + slide_windows, :], dim=0)
+        return part_clip_feat
+
+    def pad_i3d_to_feature_len(self, i3d_feat, feature_len):
+        if i3d_feat.size(1) == feature_len:
+            return i3d_feat
+        padded = torch.zeros((i3d_feat.size(0), feature_len, i3d_feat.size(-1))).to(
+            device=i3d_feat.device,
+            dtype=i3d_feat.dtype,
+        )
+        valid_len = min(feature_len, i3d_feat.size(1))
+        padded[:, :valid_len, :] = i3d_feat[:, :valid_len, :]
+        return padded
+
+    def get_i3d_fused_sign_output(self, pose_all, clips_start, slide_windows, left_i3d, right_i3d, body_i3d):
+        feature_len = clips_start.size(1)
+        left_pose = self.collect_part_clip_features(pose_all['left_feat'], clips_start, slide_windows)
+        right_pose = self.collect_part_clip_features(pose_all['right_feat'], clips_start, slide_windows)
+        body_pose = self.collect_part_clip_features(pose_all['body_feat'], clips_start, slide_windows)
+
+        left_i3d = self.pad_i3d_to_feature_len(left_i3d, feature_len)
+        right_i3d = self.pad_i3d_to_feature_len(right_i3d, feature_len)
+        body_i3d = self.pad_i3d_to_feature_len(body_i3d, feature_len)
+
+        left_fused = self.left_i3d_fusion(left_pose, left_i3d)
+        right_fused = self.right_i3d_fusion(right_pose, right_i3d)
+        body_fused = self.body_i3d_fusion(body_pose, body_i3d)
+
+        part_features = torch.stack([left_fused, right_fused, body_fused], dim=2)
+        fused = self.part_attention(part_features)
+        fused = self.i3d_fusion_output(fused)
+        return fused.permute(0, 2, 1).unsqueeze(-1)
 
     def get_visual_output(self, right_batch, left_batch, body_batch, shaped=True, get_hidden=True):
         

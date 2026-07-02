@@ -243,10 +243,16 @@ class GCN_Embed(nn.Module):
         right_pose = pose['right']
         left_pose = pose['left']
         body_pose = pose['body']
+        #hand[B, T, 21, 2] ->  [B, T, 512]
+        #body[B, T, 7, 2] ->  [B, T, 512]
         right_feat = self.st_gcn_hand(right_pose)
         left_feat = self.st_gcn_hand(left_pose)
         body_feat = self.st_gcn_body(body_pose)
         pose_feat = torch.cat([left_feat, right_feat, body_feat], dim=-1)
+        # 拼接后：pose_feat: [B, T, 1536]
+        pose['left_feat'] = left_feat
+        pose['right_feat'] = right_feat
+        pose['body_feat'] = body_feat
         pose['feat'] = pose_feat
         
         return pose
@@ -259,6 +265,9 @@ class GCN_Embed(nn.Module):
         left_feat = self.st_gcn_hand(left_pose)
         body_feat = self.st_gcn_body(body_pose)
         pose_feat = torch.cat([left_feat, right_feat, body_feat], dim=-1)
+        pose['left_feat'] = left_feat
+        pose['right_feat'] = right_feat
+        pose['body_feat'] = body_feat
         pose['feat'] = pose_feat
         return pose
     

@@ -52,6 +52,23 @@ SEDS
             └──video1.pkl...
 
 ```
+
+## Pose-aligned I3D feature extraction
+For custom videos, `scripts/extract_pose_i3d_features.py` can extract offline RGB features from pose-aligned crops. The script follows the pose dataloader clip logic: `slide_windows=16`, `windows_stride=1`, and at most `feature_len=64` clips per video. Run it on a server environment with `numpy`, `opencv-python`, `torch`, a local clone of `piergiaj/pytorch-i3d`, and `rgb_imagenet.pt`:
+```
+python scripts/extract_pose_i3d_features.py \
+  --pose data_ph/S000020_P0004_T00.pkl \
+  --rgb-dir /path/to/video_frames \
+  --frame-pattern "images{:04d}.png" \
+  --frame-offset 1 \
+  --i3d-repo /path/to/pytorch-i3d \
+  --model /path/to/pytorch-i3d/models/rgb_imagenet.pt \
+  --part body \
+  --save-crops-dir /path/to/debug_body_crops \
+  --output /path/to/I3D_features
+```
+The output file is named `<pose_stem>_<part>.npy` when `--output` is a directory. Its shape is `[num_clips, 1024]` after temporal/spatial pooling of `InceptionI3d.extract_features()`.
+When `--save-crops-dir` is provided, the cropped frames used by I3D are also written under `<pose_stem>_<part>/clip_XXXX/frame_YYYYY.png` for visual inspection.
 ## Training
 Before training, you should move the `pretrain_signbert.pth` to the `ckpts` folder and move the `ViT-B-32.pt` to the `modules` folder. Then, you can train the DIRE model by running the following command:
 ```

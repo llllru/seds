@@ -13,12 +13,10 @@ main_task_retrieval.py --do_train --num_thread_reader=64 \
 --lr 1e-5 --sign_lr 1e-4 \
 --max_words 32 --feature_len 64 --max_length_frames 300 \
 --slide_windows 16 --windows_stride 1 \
---original_size_w 384 --original_size_h 288 \
+--original_size_w 210 --original_size_h 260 \
 --crop_size 256 --frames_threshold 0.1 --threshold 0.3 \
 --batch_size_val 48 \
 --text_aug true \
 --datatype ph_pose --coef_lr 1. --freeze_layer_num 0 \
 --linear_patch 2d --sim_header Filip \
 --pretrained_clip_name ViT-B/32 \
---init_model result_train/ph/pytorch_model.bin.139 \
---resume_model result_train/ph/pytorch_opt.bin.139

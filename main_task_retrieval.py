@@ -9,6 +9,7 @@ import random
 import pickle as pkl
 import os
 from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
+from retrieval_logging import format_best_metrics_log
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
@@ -111,6 +112,19 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument('--resize', default=256, type=int)
     parser.add_argument('--interval', default=2, type=int)
     ##########  Token length   ##########
+
+    ##########  Local I3D features   ##########
+    parser.add_argument('--use_i3d_local_features', action='store_true',
+                        help='Load pose-guided local I3D features in PH dataloaders.')
+    parser.add_argument('--i3d_left_features_path', type=str, default='',
+                        help='Root path for left-hand I3D npy features.')
+    parser.add_argument('--i3d_right_features_path', type=str, default='',
+                        help='Root path for right-hand I3D npy features.')
+    parser.add_argument('--i3d_face_features_path', type=str, default='',
+                        help='Root path for face/head I3D npy features.')
+    parser.add_argument('--i3d_body_features_path', type=str, default='',
+                        help='Root path for body I3D npy features.')
+    ##########  Local I3D features   ##########
     
     ##########  SignBert paras   ##########
     parser.add_argument('--fusion_type', default='mlp', type=str, choices='mlp, gloss_atten')
@@ -395,9 +409,15 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             print(torch.cuda.memory_allocated()/1024.0/1024)
         
         sample = batch
-        right_batch = {'pose':sample['right_pose']}
-        left_batch = {'pose':sample['left_pose']}
-        body_batch = {'pose':sample['body_pose'], 'clips_start':sample['body_clips_start'], 'mask':sample['body_mask']}
+        right_batch = {'pose': sample['right_pose'], 'i3d': sample.get('right_i3d')}
+        left_batch = {'pose': sample['left_pose'], 'i3d': sample.get('left_i3d')}
+        body_batch = {
+            'pose': sample['body_pose'],
+            'clips_start': sample['body_clips_start'],
+            'mask': sample['body_mask'],
+            'i3d': sample.get('body_i3d'),
+            'i3d_mask': sample.get('i3d_mask'),
+        }
         
         input_ids = sample['pairs_text']
         input_mask = sample['pairs_mask']
@@ -531,9 +551,15 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
 
             batch = {k:v.to(device) for k,v in batch.items()}
             sample = batch
-            right_batch = {'pose':sample['right_pose']}
-            left_batch = {'pose':sample['left_pose']}
-            body_batch = {'pose':sample['body_pose'], 'clips_start':sample['body_clips_start'], 'mask':sample['body_mask']}
+            right_batch = {'pose': sample['right_pose'], 'i3d': sample.get('right_i3d')}
+            left_batch = {'pose': sample['left_pose'], 'i3d': sample.get('left_i3d')}
+            body_batch = {
+                'pose': sample['body_pose'],
+                'clips_start': sample['body_clips_start'],
+                'mask': sample['body_mask'],
+                'i3d': sample.get('body_i3d'),
+                'i3d_mask': sample.get('i3d_mask'),
+            }
             video_mask = sample['body_mask']
             
             input_ids = sample['pairs_text']
@@ -621,7 +647,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
     end_time = time.time() 
     print("操作耗时：", (end_time - start_time)*1000, "毫秒")
     torch.cuda.empty_cache()
-    return R1
+    return R1, tv_metrics, vt_metrics
 
 def main():
     global logger
@@ -673,6 +699,8 @@ def main():
 
         best_score = -0.00001
         best_epoch=0
+        best_t2v_metrics = None
+        best_v2t_metrics = None
         ## ##############################################################
         # resume optimizer state besides loss to continue trainxz
         ## ##############################################################
@@ -699,12 +727,21 @@ def main():
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
             if args.local_rank == 0:
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
+                R1, t2v_metrics, v2t_metrics = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
                 if best_score <= R1:
                     best_score = R1
                     best_epoch=epoch
+                    best_t2v_metrics = t2v_metrics
+                    best_v2t_metrics = v2t_metrics
                     best_output_model_file = save_best_model(epoch, args, model, optimizer, tr_loss, type_name="")
-                logger.info("The best model is: {}{}, the R1 is: {:.4f}, the model file is {}".format(args.output_dir,best_epoch, best_score, best_output_model_file))
+                logger.info(format_best_metrics_log(
+                    args.output_dir,
+                    best_epoch,
+                    best_score,
+                    best_output_model_file,
+                    best_t2v_metrics,
+                    best_v2t_metrics,
+                ))
                 loss_record.append(tr_loss)
                 acc_record.append(R1)
                 logger.info(loss_record)
