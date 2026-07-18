@@ -105,6 +105,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         self.kl_logit = task_config.kl_logit
         self.rgb_pose_match = task_config.rgb_pose_match
         self.rgb_pose_match_loss = task_config.rgb_pose_match_loss
+        self.alpha = task_config.alpha
 
         show_log(task_config, "Stage-One:{}, Stage-Two:{}".format(self._stage_one, self._stage_two))
 
@@ -250,7 +251,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 if self.freeze_exfusion:
                     loss += sim_loss
                 else:
-                    loss += sim_loss + sim_loss_pose + sim_loss_rgb + loss_pose_kl + loss_rgb_kl + sim_loss_r2p
+                    loss += sim_loss + self.alpha * (sim_loss_pose + sim_loss_rgb) + loss_pose_kl + loss_rgb_kl + sim_loss_r2p
 
             return loss, sim_loss, sim_loss_pose, sim_loss_rgb, loss_pose_kl, loss_rgb_kl, sim_loss_r2p
         else:

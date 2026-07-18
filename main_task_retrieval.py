@@ -165,7 +165,14 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--datatype", default="h2s", type=str, help="Point the dataset to finetune.")
 
     parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
+    parser.add_argument(
+        "--local_rank",
+        "--local-rank",
+        dest="local_rank",
+        default=int(os.environ.get("LOCAL_RANK", 0)),
+        type=int,
+        help="distributed training local rank",
+    )
     parser.add_argument("--rank", default=0, type=int, help="distribted training")
     parser.add_argument('--use_mil', action='store_true', help="Whether use MIL as Miech et. al. (2020).")
     parser.add_argument('--sampled_use_mil', action='store_true', help="Whether MIL, has a high priority than use_mil.")
