@@ -671,38 +671,41 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
 
         vt_metrics_fusion = tensor_text_to_video_metrics(sim_matrix_i2t_fusion)
         tv_metrics_fusion = compute_metrics(tensor_video_to_text_sim(sim_matrix_t2i_fusion))
-        logger.info("Mix_Text-to-Video:")
+        logger.info("Mix Text-to-Video (T2V):")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(tv_metrics_fusion['R1'], tv_metrics_fusion['R5'], tv_metrics_fusion['R10'], tv_metrics_fusion['MR'], tv_metrics_fusion['MeanR']))
-        logger.info("Mix_Video-to-Text:")
+        logger.info("Mix Video-to-Text (V2T):")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(vt_metrics_fusion['R1'], vt_metrics_fusion['R5'], vt_metrics_fusion['R10'], vt_metrics_fusion['MR'], vt_metrics_fusion['MeanR']))
 
         vt_metrics = tensor_text_to_video_metrics(sim_matrix_i2t_pose)
         tv_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix_t2i_pose))
-        logger.info("Pos_Text-to-Video:")
+        logger.info("Pose Text-to-Video (T2V):")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
-        logger.info("Pos_Video-to-Text:")
+        logger.info("Pose Video-to-Text (V2T):")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
         
         vt_metrics = tensor_text_to_video_metrics(sim_matrix_i2t_rgb)
         tv_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix_t2i_rgb))
-        logger.info("RGB_Text-to-Video:")
+        logger.info("RGB Text-to-Video (T2V):")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
-        logger.info("RGB_Video-to-Text:")
+        logger.info("RGB Video-to-Text (V2T):")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
 
 
-    R1 = tv_metrics_fusion['R1']
+    fusion_metrics = {
+        "T2V": tv_metrics_fusion,
+        "V2T": vt_metrics_fusion,
+    }
 
     end_time = time.time() 
     print("操作耗时：", (end_time - start_time)*1000, "毫秒")
     torch.cuda.empty_cache()
-    return R1
+    return fusion_metrics
 
 def main():
     global logger
@@ -754,6 +757,7 @@ def main():
 
         best_score = -0.00001
         best_epoch=0
+        best_fusion_metrics = None
         ## ##############################################################
         # resume optimizer state besides loss to continue trainxz
         ## ##############################################################
@@ -766,23 +770,59 @@ def main():
         global_step = 0
         loss_record=[]
         acc_record=[]
+        total_train_time = 0.0
         for epoch in range(resumed_epoch, args.epochs):
             if args.distributed==True:
                 train_sampler.set_epoch(epoch)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            epoch_train_start_time = time.time()
             tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
                                                scheduler, global_step, local_rank=args.local_rank)
-            if args.local_rank == 0 and (epoch+1)%10==0:
-                logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            epoch_train_time = time.time() - epoch_train_start_time
+            total_train_time += epoch_train_time
+            if args.local_rank == 0:
+                logger.info(
+                    "Epoch %d/%s Finished, Train Loss: %f, Training Time: %.2f seconds (%.2f minutes)",
+                    epoch + 1,
+                    args.epochs,
+                    tr_loss,
+                    epoch_train_time,
+                    epoch_train_time / 60.0,
+                )
 
-                output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
+                if (epoch+1)%10==0:
+                    output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
             if args.local_rank == 0:
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
+                fusion_metrics = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
+                R1 = fusion_metrics["T2V"]["R1"]
                 if best_score <= R1:
                     best_score = R1
                     best_epoch=epoch
+                    best_fusion_metrics = fusion_metrics
                     best_output_model_file = save_best_model(epoch, args, model, optimizer, tr_loss, type_name="")
-                logger.info("The best model is: {}{}, the R1 is: {:.4f}, the model file is {}".format(args.output_dir,best_epoch, best_score, best_output_model_file))
+                logger.info(
+                    "The best model is from epoch {}/{}, the model file is {}".format(
+                        best_epoch + 1, args.epochs, best_output_model_file
+                    )
+                )
+                logger.info(
+                    "Best Fusion T2V: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}".format(
+                        best_fusion_metrics["T2V"]["R1"],
+                        best_fusion_metrics["T2V"]["R5"],
+                        best_fusion_metrics["T2V"]["R10"],
+                    )
+                )
+                logger.info(
+                    "Best Fusion V2T: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}".format(
+                        best_fusion_metrics["V2T"]["R1"],
+                        best_fusion_metrics["V2T"]["R5"],
+                        best_fusion_metrics["V2T"]["R10"],
+                    )
+                )
                 loss_record.append(tr_loss)
                 acc_record.append(R1)
                 logger.info(loss_record)
@@ -790,6 +830,14 @@ def main():
 
                 if epoch == args.stop_epochs:
                     break
+
+        if args.local_rank == 0:
+            logger.info(
+                "Total Training Time: %.2f seconds (%.2f minutes / %.2f hours)",
+                total_train_time,
+                total_train_time / 60.0,
+                total_train_time / 3600.0,
+            )
 
     elif args.do_eval:
         if args.local_rank == 0:
