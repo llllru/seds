@@ -1,11 +1,11 @@
 DATA_PATH=""
 TIME_NOW=$(date +%Y%m%d%H%M%S)
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" python -m torch.distributed.launch --nproc_per_node=8 --master_port 29668 \
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" python -m torch.distributed.launch --nproc_per_node=2 --master_port 28451 \
 main_task_retrieval.py --do_train --num_thread_reader=64 \
---epochs=200 --batch_size=128 --n_display=10 \
+--epochs=200 --batch_size=32 --n_display=10 \
 --data_path data_h2 \
 --features_path "./How2Sign/processed_videos_256/RTMpose/Pose_all_24rates/" \
---features_RGB_path "./How2Sign/processed_videos_256/I3D_features/" \
+--features_RGB_path "/media/hdd2/lyr2025/seds_data/How2Sign/processed_videos_256/I3D_features/" \
 --output_dir result_train/h2s \
 --signbert --init_sign_model ckpts/pretrain_signbert.pth \
 --fusion_type 'gloss_atten' --rgb_pose_match --rgb_pose_match_loss 0.4 \

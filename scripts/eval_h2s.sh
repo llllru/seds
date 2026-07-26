@@ -3,8 +3,8 @@ TIME_NOW=$(date +%Y%m%d%H%M%S)
 CUDA_VISIBLE_DEVICES="0" torchun --nproc_per_node=1 --master_port 29668 \
 main_task_retrieval.py --do_eval \
 --data_path data_h2 \
---features_path "./How2Sign/RTMpose/Pose_all_24rates/" \
---features_RGB_path "./How2Sign/I3D_features/" \
+--features_path "./How2Sign/processed_videos_256/RTMpose/Pose_all_24rates/" \
+--features_RGB_path "/media/hdd2/lyr2025/seds_data/How2Sign/processed_videos_256/I3D_features/" \
 --output_dir result_eval/eval_h2s \
 --signbert \
 --init_model ckpts/h2s_best_model.bin \

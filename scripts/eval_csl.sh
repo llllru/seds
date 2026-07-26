@@ -1,10 +1,10 @@
 DATA_PATH=""
 TIME_NOW=$(date +%Y%m%d%H%M%S)
-CUDA_VISIBLE_DEVICES="0" torchun --nproc_per_node=1 --master_port 29448 \
+CUDA_VISIBLE_DEVICES="0" torchrun --nproc_per_node=1 --master_port 29448 \
 main_task_retrieval.py --do_eval \
 --data_path data_csl \
---features_path "./CSL/RTM_Keypoints/" \
---features_RGB_path "./CSL/I3D_features/" \
+--features_path "/media/hdd2/lyr2025/seds_data/CSL/RTM_Keypoints/" \
+--features_RGB_path "media/hdd2/lyr2025/seds_data/CSL/I3D_features/" \
 --output_dir result_eval/eval_csl \
 --signbert \
 --init_model ckpts/csl_best_model.bin \
