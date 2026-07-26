@@ -10,6 +10,11 @@ import numpy as np
 import pickle as pkl
 import random
 import math
+import nltk
+# textaugment 的 EDA() 每次实例化都会联网 nltk.download('stopwords'/'wordnet')，
+# 服务器网络抖动时会抛 SSL 错刷屏。词库已在本地缓存，这里把 download 置为空操作，
+# 让它跳过联网、直接读本地数据（需保证 ~/nltk_data 里已有 stopwords/wordnet）。
+nltk.download = lambda *args, **kwargs: True
 
 from textaugment import EDA
 from random import choice
