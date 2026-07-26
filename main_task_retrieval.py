@@ -810,14 +810,14 @@ def main():
                     )
                 )
                 logger.info(
-                    "Best Fusion T2V: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}".format(
+                    "Best Fusion T2V: R@1: {:.4f} - R@5: {:.4f} - R@10: {:.4f}".format(
                         best_fusion_metrics["T2V"]["R1"],
                         best_fusion_metrics["T2V"]["R5"],
                         best_fusion_metrics["T2V"]["R10"],
                     )
                 )
                 logger.info(
-                    "Best Fusion V2T: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f}".format(
+                    "Best Fusion V2T: R@1: {:.4f} - R@5: {:.4f} - R@10: {:.4f}".format(
                         best_fusion_metrics["V2T"]["R1"],
                         best_fusion_metrics["V2T"]["R5"],
                         best_fusion_metrics["V2T"]["R10"],
