@@ -4,7 +4,7 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" python -m torch.distributed.launch --npro
 main_task_retrieval.py --do_train --num_thread_reader=64 \
 --epochs=200 --batch_size=32 --n_display=10 \
 --data_path data_h2 \
---features_path "./How2Sign/processed_videos_256/RTMpose/Pose_all_24rates/" \
+--features_path "/media/hdd2/lyr2025/seds_data/CSL/RTM_Keypoints/" \
 --features_RGB_path "/media/hdd2/lyr2025/seds_data/How2Sign/processed_videos_256/I3D_features/" \
 --output_dir result_train/h2s \
 --signbert --init_sign_model ckpts/pretrain_signbert.pth \

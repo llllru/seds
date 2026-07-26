@@ -17,4 +17,3 @@ main_task_retrieval.py --do_eval \
 --datatype ph_pose --coef_lr 1. --freeze_layer_num 0 \
 --linear_patch 2d --sim_header Filip \
 --pretrained_clip_name ViT-B/32
-
