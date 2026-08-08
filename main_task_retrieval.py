@@ -84,6 +84,12 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--init_model", default=None, type=str, required=False, help="Initial model.")
     parser.add_argument("--init_sign_model", default=None, type=str, required=False, help="Initial model.")
     parser.add_argument("--resume_model", default=None, type=str, required=False, help="Resume train model.")
+    parser.add_argument(
+        "--resume_best_score",
+        default=None,
+        type=float,
+        help="Historical best T2V R@1 for resuming a legacy checkpoint without best_score.",
+    )
     ##########  Learning paras  ##########
 
     ##########  Token length   ##########
@@ -107,6 +113,39 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--rgb_pose_match", action='store_true', help="")
     parser.add_argument('--rgb_pose_match_loss', type=float, default=0.4, help='')
     parser.add_argument('--fusion_type', default='mlp', type=str, choices='mlp, gloss_atten')
+    parser.add_argument(
+        "--dynamic_modal_gate",
+        action="store_true",
+        help="Enable a clip-level dynamic gate for Pose/RGB fusion.",
+    )
+    parser.add_argument(
+        "--full_path_modal_gate",
+        action="store_true",
+        help=(
+            "Apply the modal gate to both the fusion-MLP inputs and the "
+            "outer residual. Requires --dynamic_modal_gate."
+        ),
+    )
+    parser.add_argument(
+        "--gate_hidden_dim",
+        type=int,
+        default=256,
+        help="Hidden dimension of the clip-level Pose/RGB gate.",
+    )
+    parser.add_argument(
+        "--gate_only_train",
+        action="store_true",
+        help="Freeze the pretrained model and train only fusion.modal_gate.",
+    )
+    parser.add_argument(
+        "--gate_lr",
+        type=float,
+        default=None,
+        help=(
+            "Peak learning rate for fusion.modal_gate. Defaults to 3e-5 in "
+            "gate-only training, otherwise to sign_lr."
+        ),
+    )
     parser.add_argument("--rgb_pose_kl", action='store_true', help="")
     parser.add_argument('--kl_pose_loss', type=float, default=0.5, help='')
     parser.add_argument('--kl_rgb_loss', type=float, default=0.5, help='')
@@ -203,6 +242,28 @@ def get_args(description='CLCL on Retrieval Task'):
         args.loose_type = False
 
     # Check paramenters
+    if args.gate_hidden_dim < 1:
+        raise ValueError("gate_hidden_dim must be a positive integer.")
+    if args.dynamic_modal_gate and args.fusion_type != "gloss_atten":
+        raise ValueError(
+            "dynamic_modal_gate requires --fusion_type gloss_atten."
+        )
+    if args.gate_only_train and not args.dynamic_modal_gate:
+        raise ValueError("gate_only_train requires --dynamic_modal_gate.")
+    if args.full_path_modal_gate and not args.dynamic_modal_gate:
+        raise ValueError(
+            "full_path_modal_gate requires --dynamic_modal_gate."
+        )
+    if args.gate_only_train:
+        # These auxiliary losses do not depend on modal_gate, so they cannot
+        # update it and only add compute/constant terms to the reported loss.
+        args.freeze_exfusion = True
+        args.rgb_pose_match = False
+        args.rgb_pose_kl = False
+    if args.gate_lr is None:
+        args.gate_lr = 3e-5 if args.gate_only_train else args.sign_lr
+    if args.gate_lr <= 0:
+        raise ValueError("gate_lr must be positive.")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
             args.gradient_accumulation_steps))
@@ -276,34 +337,98 @@ def init_model(args, device):
 
     return model
 
+def configure_trainable_parameters(args, model):
+    if not args.gate_only_train:
+        return
+
+    gate_prefix = "fusion.modal_gate."
+    trainable_names = []
+    for name, param in model.named_parameters():
+        param.requires_grad = name.startswith(gate_prefix)
+        if param.requires_grad:
+            trainable_names.append(name)
+
+    if not trainable_names:
+        raise ValueError(
+            "gate_only_train did not find any fusion.modal_gate parameters. "
+            "Check --dynamic_modal_gate and the fusion architecture."
+        )
+
+    if args.local_rank == 0:
+        trainable_count = sum(
+            param.numel() for param in model.parameters() if param.requires_grad
+        )
+        total_count = sum(param.numel() for param in model.parameters())
+        logger.info(
+            "Gate-only training enabled: %d/%d parameters are trainable (%.4f%%).",
+            trainable_count,
+            total_count,
+            100.0 * trainable_count / total_count,
+        )
+        logger.info("Trainable gate parameters: %s", ", ".join(trainable_names))
+
+def set_model_train_mode(args, model):
+    model.train()
+    if not args.gate_only_train:
+        return
+
+    model_to_configure = model.module if hasattr(model, "module") else model
+
+    # Keep every frozen feature extractor in inference mode so BatchNorm running
+    # statistics and Dropout do not change the pretrained representation.
+    model_to_configure.eval()
+
+    # CLIP4Clip.forward uses the root training flag to build the retrieval loss
+    # and run the distributed all-gather path.
+    model_to_configure.training = True
+    model_to_configure.fusion.modal_gate.train()
+
 def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, local_rank, coef_lr=1.):
 
     if hasattr(model, 'module'):
         model = model.module
         
-    param_optimizer = list(model.named_parameters())
+    configure_trainable_parameters(args, model)
+    param_optimizer = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
 
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    no_decay = [
+        'bias',
+        'LayerNorm.bias',
+        'LayerNorm.weight',
+        'modal_gate.pose_norm.weight',
+        'modal_gate.rgb_norm.weight',
+    ]
 
     decay_param_tp = [(n, p) for n, p in param_optimizer if not any(nd in n for nd in no_decay)]
     no_decay_param_tp = [(n, p) for n, p in param_optimizer if any(nd in n for nd in no_decay)]
 
-    decay_clip_param_tp = [(n, p) for n, p in decay_param_tp if ("clip." in n) or ("clip_rgb." in n) ]
-    decay_sign_param_tp = [(n, p) for n, p in decay_param_tp if "signbert." in n ]
-    decay_noclipsign_param_tp = [(n, p) for n, p in decay_param_tp if ("clip." not in n) and ("clip_rgb." not in n) and ("signbert." not in n)]
+    decay_gate_param_tp = [(n, p) for n, p in decay_param_tp if n.startswith("fusion.modal_gate.")]
+    decay_clip_param_tp = [(n, p) for n, p in decay_param_tp if (("clip." in n) or ("clip_rgb." in n)) and not n.startswith("fusion.modal_gate.")]
+    decay_sign_param_tp = [(n, p) for n, p in decay_param_tp if "signbert." in n and not n.startswith("fusion.modal_gate.")]
+    decay_noclipsign_param_tp = [(n, p) for n, p in decay_param_tp if ("clip." not in n) and ("clip_rgb." not in n) and ("signbert." not in n) and not n.startswith("fusion.modal_gate.")]
 
-    no_decay_clip_param_tp = [(n, p) for n, p in no_decay_param_tp if ("clip." in n) or ("clip_rgb." in n) ]
-    no_decay_sign_param_tp = [(n, p) for n, p in no_decay_param_tp if "signbert." in n]
-    no_decay_noclipsign_param_tp = [(n, p) for n, p in no_decay_param_tp if ("clip." not in n) and ("clip_rgb." not in n) and ("signbert." not in n)]
+    no_decay_gate_param_tp = [(n, p) for n, p in no_decay_param_tp if n.startswith("fusion.modal_gate.")]
+    no_decay_clip_param_tp = [(n, p) for n, p in no_decay_param_tp if (("clip." in n) or ("clip_rgb." in n)) and not n.startswith("fusion.modal_gate.")]
+    no_decay_sign_param_tp = [(n, p) for n, p in no_decay_param_tp if "signbert." in n and not n.startswith("fusion.modal_gate.")]
+    no_decay_noclipsign_param_tp = [(n, p) for n, p in no_decay_param_tp if ("clip." not in n) and ("clip_rgb." not in n) and ("signbert." not in n) and not n.startswith("fusion.modal_gate.")]
 
     weight_decay = 0.001
     optimizer_grouped_parameters = [
+        {'params': [p for n, p in decay_gate_param_tp], 'weight_decay': weight_decay, 'lr': args.gate_lr},
+        {'params': [p for n, p in no_decay_gate_param_tp], 'weight_decay': 0.0, 'lr': args.gate_lr},
         {'params': [p for n, p in decay_clip_param_tp], 'weight_decay': weight_decay, 'lr': args.lr * coef_lr},
         {'params': [p for n, p in decay_sign_param_tp], 'weight_decay': weight_decay, 'lr': args.sign_lr * coef_lr},
         {'params': [p for n, p in decay_noclipsign_param_tp], 'weight_decay': weight_decay},
         {'params': [p for n, p in no_decay_clip_param_tp], 'weight_decay': 0.0, 'lr': args.lr * coef_lr},
         {'params': [p for n, p in no_decay_sign_param_tp], 'weight_decay': 0.0, 'lr': args.sign_lr * coef_lr},
         {'params': [p for n, p in no_decay_noclipsign_param_tp], 'weight_decay': 0.0},
+    ]
+    optimizer_grouped_parameters = [
+        group for group in optimizer_grouped_parameters if group['params']
     ]
 
     scheduler = None
@@ -312,31 +437,39 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
                          t_total=num_train_optimization_steps, weight_decay=weight_decay,
                          max_grad_norm=1.0)
     if args.distributed==True:
+        find_unused_parameters = not args.gate_only_train
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank],
-                                                          output_device=local_rank, find_unused_parameters=True)
+                                                          output_device=local_rank,
+                                                          find_unused_parameters=find_unused_parameters)
     else:
         model = torch.nn.DataParallel(model, device_ids=args.gpu_ids).cuda()
 
     return optimizer, scheduler, model
 
-def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
+def save_model(epoch, args, model, optimizer, tr_loss, type_name="",
+               best_score=None, best_epoch=None, best_fusion_metrics=None):
     # Only save the model it-self
     model_to_save = model.module if hasattr(model, 'module') else model
+    checkpoint_epoch = epoch + 1
     output_model_file = os.path.join(
-        args.output_dir, "pytorch_model.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
+        args.output_dir, "pytorch_model.bin.{}{}".format("" if type_name=="" else type_name+".", checkpoint_epoch))
     optimizer_state_file = os.path.join(
-        args.output_dir, "pytorch_opt.bin.{}{}".format("" if type_name=="" else type_name+".", epoch))
+        args.output_dir, "pytorch_opt.bin.{}{}".format("" if type_name=="" else type_name+".", checkpoint_epoch))
     torch.save(model_to_save.state_dict(), output_model_file)
     torch.save({
             'epoch': epoch,
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': tr_loss,
+            'best_score': best_score,
+            'best_epoch': best_epoch,
+            'best_fusion_metrics': best_fusion_metrics,
             }, optimizer_state_file)
     logger.info("Model saved to %s", output_model_file)
     logger.info("Optimizer saved to %s", optimizer_state_file)
     return output_model_file
 
-def save_best_model(epoch, args, model, optimizer, tr_loss, type_name=""):
+def save_best_model(epoch, args, model, optimizer, tr_loss, type_name="",
+                    best_score=None, best_epoch=None, best_fusion_metrics=None):
     # Only save the model it-self
     model_to_save = model.module if hasattr(model, 'module') else model
     output_model_file = os.path.join(
@@ -348,6 +481,9 @@ def save_best_model(epoch, args, model, optimizer, tr_loss, type_name=""):
             'epoch': epoch,
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': tr_loss,
+            'best_score': best_score,
+            'best_epoch': best_epoch,
+            'best_fusion_metrics': best_fusion_metrics,
             }, optimizer_state_file)
     logger.info("Model saved to %s", output_model_file)
     logger.info("Optimizer saved to %s", optimizer_state_file)
@@ -376,7 +512,7 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
 def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0):
     global logger
     torch.cuda.empty_cache()
-    model.train()
+    set_model_train_mode(args, model)
     log_step = args.n_display
     start_time = time.time()
     total_loss = 0
@@ -426,7 +562,10 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         total_loss += float(loss)
         if (step + 1) % args.gradient_accumulation_steps == 0:
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                (param for param in model.parameters() if param.requires_grad),
+                1.0,
+            )
 
             if scheduler is not None:
                 scheduler.step()  # Update learning rate schedule
@@ -545,6 +684,11 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         logger.warning("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
 
     model.eval()
+    gate_statistics_enabled = (
+        args.dynamic_modal_gate
+        and hasattr(model, "fusion")
+        and hasattr(model.fusion, "start_gate_statistics")
+    )
 
     start_time = time.time()
     with torch.no_grad():
@@ -599,12 +743,26 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         # 2. calculate the similarity
         # ----------------------------------
 
+        if gate_statistics_enabled:
+            model.fusion.start_gate_statistics()
 
     #########################################
 
 
         sim_matrix_i2t_fusion, sim_matrix_t2i_fusion, sim_matrix_i2t_pose, sim_matrix_t2i_pose, sim_matrix_i2t_rgb, sim_matrix_t2i_rgb = _run_on_single_gpu_new_mix(model,  batch_list_v,batch_list_t, batch_sequence_output_list, batch_visual_output_pose_list,\
                                                            batch_visual_output_rgb_list,is_train=False,dual_mix=args.dual_mix)
+        if gate_statistics_enabled:
+            gate_statistics = model.fusion.get_gate_statistics()
+            if gate_statistics is not None:
+                logger.info(
+                    "Modal gate on valid clips: mean %.4f - std %.4f - "
+                    "min %.4f - max %.4f - count %d",
+                    gate_statistics["mean"],
+                    gate_statistics["std"],
+                    gate_statistics["min"],
+                    gate_statistics["max"],
+                    gate_statistics["count"],
+                )
         
         sim_matrix_i2t_fusion = np.concatenate(tuple(sim_matrix_i2t_fusion), axis=0)
         sim_matrix_t2i_fusion = np.concatenate(tuple(sim_matrix_t2i_fusion), axis=0)
@@ -755,9 +913,10 @@ def main():
             logger.info("  Batch size = %d", args.batch_size)
             logger.info("  Num steps = %d", num_train_optimization_steps * args.gradient_accumulation_steps)
 
-        best_score = -0.00001
-        best_epoch=0
+        best_score = float("-inf")
+        best_epoch = -1
         best_fusion_metrics = None
+        best_output_model_file = os.path.join(args.output_dir, "pytorch_best_model.bin")
         ## ##############################################################
         # resume optimizer state besides loss to continue trainxz
         ## ##############################################################
@@ -766,6 +925,83 @@ def main():
             checkpoint = torch.load(args.resume_model, map_location='cpu')
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             resumed_epoch = checkpoint['epoch']+1
+            resume_dir = os.path.dirname(os.path.abspath(args.resume_model))
+            resume_best_model_file = os.path.join(resume_dir, "pytorch_best_model.bin")
+            resume_best_opt_file = os.path.join(resume_dir, "pytorch_best_opt.bin")
+            best_checkpoint = None
+            if os.path.exists(resume_best_opt_file):
+                best_checkpoint = torch.load(resume_best_opt_file, map_location='cpu')
+
+            checkpoint_best_score = checkpoint.get('best_score')
+            saved_best_score = (
+                best_checkpoint.get('best_score')
+                if best_checkpoint is not None
+                else None
+            )
+            if checkpoint_best_score is not None or saved_best_score is not None:
+                if saved_best_score is not None and (
+                    checkpoint_best_score is None
+                    or saved_best_score >= checkpoint_best_score
+                ):
+                    best_state = best_checkpoint
+                else:
+                    best_state = checkpoint
+                best_score = best_state['best_score']
+                best_epoch = best_state.get('best_epoch', -1)
+                best_fusion_metrics = best_state.get('best_fusion_metrics')
+            else:
+                if args.resume_best_score is None:
+                    raise ValueError(
+                        "The resume checkpoint does not contain best_score. "
+                        "Pass --resume_best_score with the historical best T2V R@1 "
+                        "from log.txt to avoid overwriting the previous best model."
+                    )
+                if not os.path.exists(resume_best_model_file):
+                    raise ValueError(
+                        "The legacy resume checkpoint has no best_score and "
+                        "pytorch_best_model.bin was not found beside it."
+                    )
+                best_score = args.resume_best_score
+                if best_checkpoint is not None:
+                    best_epoch = best_checkpoint.get('best_epoch', best_checkpoint.get('epoch', -1))
+                    best_fusion_metrics = best_checkpoint.get('best_fusion_metrics')
+                if args.local_rank == 0:
+                    logger.warning(
+                        "Legacy checkpoint detected; restored historical best T2V R@1 "
+                        "from --resume_best_score."
+                    )
+
+            if os.path.exists(resume_best_model_file):
+                best_output_model_file = resume_best_model_file
+
+        if args.gate_only_train and not args.resume_model:
+            if args.local_rank == 0:
+                logger.info(
+                    "Evaluating the equal-fusion pretrained baseline before "
+                    "gate-only training."
+                )
+                best_fusion_metrics = eval_epoch(
+                    args, model, test_dataloader, device, n_gpu, False
+                )
+                best_score = best_fusion_metrics["T2V"]["R1"]
+                best_epoch = -1
+                best_output_model_file = save_best_model(
+                    -1,
+                    args,
+                    model,
+                    optimizer,
+                    0.0,
+                    type_name="",
+                    best_score=best_score,
+                    best_epoch=best_epoch,
+                    best_fusion_metrics=best_fusion_metrics,
+                )
+                logger.info(
+                    "Gate-only baseline Fusion T2V R@1: %.4f",
+                    best_score,
+                )
+            if args.distributed:
+                torch.distributed.barrier()
         
         global_step = 0
         loss_record=[]
@@ -793,40 +1029,70 @@ def main():
                     epoch_train_time / 60.0,
                 )
 
-                if (epoch+1)%10==0:
-                    output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
-
             if args.local_rank == 0:
                 fusion_metrics = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
                 R1 = fusion_metrics["T2V"]["R1"]
-                if best_score <= R1:
+                if R1 > best_score:
                     best_score = R1
                     best_epoch=epoch
                     best_fusion_metrics = fusion_metrics
-                    best_output_model_file = save_best_model(epoch, args, model, optimizer, tr_loss, type_name="")
-                logger.info(
-                    "The best model is from epoch {}/{}, the model file is {}".format(
-                        best_epoch + 1, args.epochs, best_output_model_file
+                    best_output_model_file = save_best_model(
+                        epoch,
+                        args,
+                        model,
+                        optimizer,
+                        tr_loss,
+                        type_name="",
+                        best_score=best_score,
+                        best_epoch=best_epoch,
+                        best_fusion_metrics=best_fusion_metrics,
                     )
-                )
-                logger.info(
-                    "Best Fusion T2V: R@1: {:.4f} - R@5: {:.4f} - R@10: {:.4f}".format(
-                        best_fusion_metrics["T2V"]["R1"],
-                        best_fusion_metrics["T2V"]["R5"],
-                        best_fusion_metrics["T2V"]["R10"],
+                if best_epoch >= 0:
+                    logger.info(
+                        "The best model is from epoch {}/{}, the model file is {}".format(
+                            best_epoch + 1, args.epochs, best_output_model_file
+                        )
                     )
-                )
-                logger.info(
-                    "Best Fusion V2T: R@1: {:.4f} - R@5: {:.4f} - R@10: {:.4f}".format(
-                        best_fusion_metrics["V2T"]["R1"],
-                        best_fusion_metrics["V2T"]["R5"],
-                        best_fusion_metrics["V2T"]["R10"],
+                elif best_fusion_metrics is not None:
+                    logger.info(
+                        "The best model remains the equal-fusion pretrained "
+                        "baseline, the model file is %s",
+                        best_output_model_file,
                     )
-                )
+                if best_fusion_metrics is not None:
+                    logger.info(
+                        "Best Fusion T2V: R@1: {:.4f} - R@5: {:.4f} - R@10: {:.4f}".format(
+                            best_fusion_metrics["T2V"]["R1"],
+                            best_fusion_metrics["T2V"]["R5"],
+                            best_fusion_metrics["T2V"]["R10"],
+                        )
+                    )
+                    logger.info(
+                        "Best Fusion V2T: R@1: {:.4f} - R@5: {:.4f} - R@10: {:.4f}".format(
+                            best_fusion_metrics["V2T"]["R1"],
+                            best_fusion_metrics["V2T"]["R5"],
+                            best_fusion_metrics["V2T"]["R10"],
+                        )
+                    )
+                else:
+                    logger.info("Best Fusion T2V: R@1: %.4f", best_score)
                 loss_record.append(tr_loss)
                 acc_record.append(R1)
                 logger.info(loss_record)
                 logger.info(acc_record)
+
+                if (epoch+1)%10==0:
+                    output_model_file = save_model(
+                        epoch,
+                        args,
+                        model,
+                        optimizer,
+                        tr_loss,
+                        type_name="",
+                        best_score=best_score,
+                        best_epoch=best_epoch,
+                        best_fusion_metrics=best_fusion_metrics,
+                    )
 
                 if epoch == args.stop_epochs:
                     break
