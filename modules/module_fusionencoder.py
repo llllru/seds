@@ -47,6 +47,155 @@ class MLP_feature_fusion(nn.Module):
         
         return x
 
+
+class ReliabilityAwareModalGate(nn.Module):
+    """
+    Predict one Pose/RGB mixing weight for every video clip.
+
+    The output has shape [batch, clips, 1]. A value close to 1 favors
+    Pose, while a value close to 0 favors RGB. Padded clips are assigned
+    the neutral value 0.5.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        gate_hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if gate_hidden_dim <= 0:
+            raise ValueError("gate_hidden_dim must be a positive integer")
+
+        self.hidden_size = hidden_size
+        self.pose_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.rgb_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.gate_mlp = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "input_proj",
+                        nn.Linear(hidden_size * 4, gate_hidden_dim),
+                    ),
+                    ("gelu", QuickGELU()),
+                    ("dropout", nn.Dropout(dropout)),
+                    ("output_proj", nn.Linear(gate_hidden_dim, 1)),
+                ]
+            )
+        )
+        self._collect_statistics = False
+        self.reset_statistics()
+
+    def reset_to_equal_fusion(self):
+        """Initialize the gate to 0.5 so the old Pose+RGB residual is kept."""
+        output_proj = self.gate_mlp.output_proj
+        nn.init.zeros_(output_proj.weight)
+        nn.init.zeros_(output_proj.bias)
+
+    def reset_statistics(self):
+        self._statistics_count = 0
+        self._statistics_sum = None
+        self._statistics_square_sum = None
+        self._statistics_min = None
+        self._statistics_max = None
+
+    def start_statistics(self):
+        self.reset_statistics()
+        self._collect_statistics = True
+
+    def get_statistics(self):
+        self._collect_statistics = False
+        if self._statistics_count == 0:
+            return None
+
+        count = float(self._statistics_count)
+        mean = (self._statistics_sum / count).item()
+        second_moment = (self._statistics_square_sum / count).item()
+        variance = max(second_moment - mean * mean, 0.0)
+        return {
+            "mean": mean,
+            "std": math.sqrt(variance),
+            "min": self._statistics_min.item(),
+            "max": self._statistics_max.item(),
+            "count": self._statistics_count,
+        }
+
+    def _update_statistics(self, gate: Tensor, padding_mask: Tensor = None):
+        values = gate.detach().squeeze(-1)
+        if padding_mask is not None:
+            values = values.masked_select(~padding_mask)
+        else:
+            values = values.reshape(-1)
+
+        if values.numel() == 0:
+            return
+
+        values = values.float()
+        values_sum = values.sum()
+        values_square_sum = torch.square(values).sum()
+        values_min = values.min()
+        values_max = values.max()
+
+        self._statistics_count += values.numel()
+        if self._statistics_sum is None:
+            self._statistics_sum = values_sum
+            self._statistics_square_sum = values_square_sum
+            self._statistics_min = values_min
+            self._statistics_max = values_max
+        else:
+            self._statistics_sum = self._statistics_sum + values_sum
+            self._statistics_square_sum = (
+                self._statistics_square_sum + values_square_sum
+            )
+            self._statistics_min = torch.minimum(
+                self._statistics_min, values_min
+            )
+            self._statistics_max = torch.maximum(
+                self._statistics_max, values_max
+            )
+
+    def forward(self, pose: Tensor, rgb: Tensor, mask: Tensor = None) -> Tensor:
+        if pose.shape != rgb.shape:
+            raise ValueError(
+                "Pose and RGB features must have the same shape, got "
+                "{} and {}".format(tuple(pose.shape), tuple(rgb.shape))
+            )
+        if pose.dim() != 3 or pose.size(-1) != self.hidden_size:
+            raise ValueError(
+                "Expected Pose/RGB features shaped [batch, clips, {}], got {}"
+                .format(self.hidden_size, tuple(pose.shape))
+            )
+
+        pose_norm = self.pose_norm(pose)
+        rgb_norm = self.rgb_norm(rgb)
+        gate_input = torch.cat(
+            [
+                pose_norm,
+                rgb_norm,
+                torch.abs(pose_norm - rgb_norm),
+                pose_norm * rgb_norm,
+            ],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.gate_mlp(gate_input))
+
+        padding_mask = None
+        if mask is not None:
+            if mask.shape != pose.shape[:2]:
+                raise ValueError(
+                    "Gate mask must have shape {}, got {}".format(
+                        tuple(pose.shape[:2]), tuple(mask.shape)
+                    )
+                )
+            padding_mask = mask.to(device=gate.device, dtype=torch.bool)
+            gate = gate.masked_fill(padding_mask.unsqueeze(-1), 0.5)
+
+        if self._collect_statistics:
+            self._update_statistics(gate, padding_mask)
+
+        return gate
+
+
 class Encoder(nn.Module):
     """
     Base encoder class
@@ -360,6 +509,9 @@ class Gloss_Fusion_Transformer(Encoder):
         num_layers: int = 2,
         num_heads: int = 8,
         dropout: float = 0.1,
+        dynamic_modal_gate: bool = False,
+        full_path_modal_gate: bool = False,
+        gate_hidden_dim: int = 256,
     ):
         """
         Initializes the Transformer.
@@ -408,8 +560,31 @@ class Gloss_Fusion_Transformer(Encoder):
         self.pe = PositionalEncoding(hidden_size)
 
         self.mlp_fusion = MLP_feature_fusion(input_channel=hidden_size*2, output_channel=hidden_size)
+        self.dynamic_modal_gate = dynamic_modal_gate
+        self.full_path_modal_gate = full_path_modal_gate
+        self.modal_gate = None
+        if self.dynamic_modal_gate:
+            self.modal_gate = ReliabilityAwareModalGate(
+                hidden_size=hidden_size,
+                gate_hidden_dim=gate_hidden_dim,
+                dropout=dropout,
+            )
 
         self._output_size = hidden_size
+
+    def reset_gate_parameters(self):
+        """Restore the gated residual to the original equal-weight behavior."""
+        if self.modal_gate is not None:
+            self.modal_gate.reset_to_equal_fusion()
+
+    def start_gate_statistics(self):
+        if self.modal_gate is not None:
+            self.modal_gate.start_statistics()
+
+    def get_gate_statistics(self):
+        if self.modal_gate is None:
+            return None
+        return self.modal_gate.get_statistics()
 
     def forward(
         self, pose_mbed_src: Tensor, RGB_mbed_src: Tensor, mask: Tensor
@@ -452,7 +627,29 @@ class Gloss_Fusion_Transformer(Encoder):
         pose_mbed_src = self.P2R_layer_norm(pose_mbed_src)
         RGB_mbed_src = self.R2P_layer_norm(RGB_mbed_src)
 
-        return self.mlp_fusion(pose_mbed_src, RGB_mbed_src, mask) + pose_ori + RGB_ori
+        if not self.dynamic_modal_gate:
+            fusion_output = self.mlp_fusion(
+                pose_mbed_src, RGB_mbed_src, mask
+            )
+            return fusion_output + pose_ori + RGB_ori
+
+        gate = self.modal_gate(pose_mbed_src, RGB_mbed_src, mask)
+        if self.full_path_modal_gate:
+            pose_for_fusion = 2.0 * gate * pose_mbed_src
+            rgb_for_fusion = 2.0 * (1.0 - gate) * RGB_mbed_src
+        else:
+            # Preserve the earlier residual-only gate for old experiments and
+            # checkpoints that do not enable --full_path_modal_gate.
+            pose_for_fusion = pose_mbed_src
+            rgb_for_fusion = RGB_mbed_src
+
+        fusion_output = self.mlp_fusion(
+            pose_for_fusion, rgb_for_fusion, mask
+        )
+        dynamic_residual = 2.0 * (
+            gate * pose_ori + (1.0 - gate) * RGB_ori
+        )
+        return fusion_output + dynamic_residual
 
 
 class DeformableTransformerEncoder(Encoder):

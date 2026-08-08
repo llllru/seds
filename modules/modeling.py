@@ -106,6 +106,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         self.rgb_pose_match = task_config.rgb_pose_match
         self.rgb_pose_match_loss = task_config.rgb_pose_match_loss
         self.alpha = task_config.alpha
+        self.dynamic_modal_gate = getattr(
+            task_config, "dynamic_modal_gate", False
+        )
+        self.full_path_modal_gate = getattr(
+            task_config, "full_path_modal_gate", False
+        )
+        self.gate_hidden_dim = getattr(task_config, "gate_hidden_dim", 256)
 
         show_log(task_config, "Stage-One:{}, Stage-Two:{}".format(self._stage_one, self._stage_two))
 
@@ -152,6 +159,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         show_log(task_config, "\t rgb_dim: {}".format(task_config.rgb_dim))
         show_log(task_config, "\t pose_dim: {}".format(task_config.pose_dim))
         show_log(task_config, "\t fusion_type: {}".format(task_config.fusion_type))
+        show_log(task_config, "\t dynamic_modal_gate: {}".format(self.dynamic_modal_gate))
+        if self.dynamic_modal_gate:
+            show_log(
+                task_config,
+                "\t full_path_modal_gate: {}".format(
+                    self.full_path_modal_gate
+                ),
+            )
+            show_log(task_config, "\t gate_hidden_dim: {}".format(self.gate_hidden_dim))
 
         self.linear_patch = '2d'
         if hasattr(task_config, "linear_patch"):
@@ -190,7 +206,12 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         if self.fusion_type == "mlp":
             self.fusion = MLP_feature_fusion(input_channel=task_config.hidden_dim*2, output_channel=task_config.hidden_dim)
         elif self.fusion_type == "gloss_atten":
-            self.fusion = Gloss_Fusion_Transformer(hidden_size=task_config.hidden_dim)
+            self.fusion = Gloss_Fusion_Transformer(
+                hidden_size=task_config.hidden_dim,
+                dynamic_modal_gate=self.dynamic_modal_gate,
+                full_path_modal_gate=self.full_path_modal_gate,
+                gate_hidden_dim=self.gate_hidden_dim,
+            )
 
         if self.signbert_have:
             self.signbert = init_sign_model(args=task_config)
@@ -201,6 +222,11 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             self.loss_kl = KL(self.kl_logit)
 
         self.apply(self.init_weights)
+        if self.fusion_type == "gloss_atten" and self.dynamic_modal_gate:
+            # CLIP4Clip's global initializer touches every Linear layer.
+            # Reset the final gate projection afterwards so sigmoid(0)=0.5
+            # and a newly added gate exactly preserves the old residual.
+            self.fusion.reset_gate_parameters()
 
     def forward(self, input_ids, token_type_ids, attention_mask, right_batch, left_batch, body_batch, input_ids_aug=None, attention_mask_aug=None):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
